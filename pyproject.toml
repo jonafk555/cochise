@@ -15,7 +15,8 @@ dependencies = [
 	"python-dateutil>=2.9.0.post0", # needed only for analysis
 	"rich>=14.3.3",
 	"structlog>=25.5.0",
-	"jinja2"
+	"jinja2",
+	"python-dotenv>=1.2.2"
 ]
 
 [project.scripts]

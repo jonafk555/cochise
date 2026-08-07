@@ -215,12 +215,16 @@ $ pip install -e .
 Now prepare a `.env` file within the *cochise* directory:
 
 ``` shell
-# if you want to use openai
+# choose one LLM provider and model
+LLM_PROVIDER='openai'
+LLM_MODEL='gpt-4o'
 OPENAI_API_KEY='sk-...'
-# if you want to use gemini
-GOOGLE_API_KEY='...'
-# if you want to use deepseek
-DEEPSEEK_API_KEY='sk-...'
+
+# Claude: LLM_PROVIDER='claude', LLM_MODEL='claude-sonnet-4-5', ANTHROPIC_API_KEY='sk-ant-...'
+# Gemini: LLM_PROVIDER='gemini', LLM_MODEL='gemini-2.5-flash', GEMINI_API_KEY='...'
+# Ollama: LLM_PROVIDER='local', LOCAL_LLM_BACKEND='ollama', LLM_MODEL='llama3.1'
+# LM Studio/vLLM: LLM_PROVIDER='local', LOCAL_LLM_BACKEND='openai-compatible',
+#                 LLM_MODEL='your-model', LOCAL_LLM_BASE_URL='http://127.0.0.1:1234/v1'
 
 # enter the credentials from the configured kali virtual machine
 TARGET_HOST=192.168.56.100

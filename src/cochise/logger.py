@@ -80,7 +80,14 @@ class Logger:
             if isinstance(result, dict):
                 result = Pretty(result)
 
-            cost_str = f"Tokens: {costs['total_tokens']} (prompt: {costs['prompt_tokens']}, cached: {costs['prompt_tokens_details']['cached_tokens']}, completion: {costs['completion_tokens']}), Cost: ${costs['cost']:.4f}, Duration: {duration:.2f}s"
+            prompt_details = costs.get("prompt_tokens_details") or {}
+            cost_str = (
+                f"Tokens: {costs.get('total_tokens', 0)} "
+                f"(prompt: {costs.get('prompt_tokens', 0)}, "
+                f"cached: {prompt_details.get('cached_tokens', 0)}, "
+                f"completion: {costs.get('completion_tokens', 0)}), "
+                f"Cost: ${costs.get('cost', 0.0):.4f}, Duration: {duration:.2f}s"
+            )
             try:
                 self.console.print(Panel(result, title=f"LLM Call Result for {name}", subtitle=cost_str))
             except NotRenderableError as e:

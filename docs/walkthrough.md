@@ -22,7 +22,7 @@ Cochise is an autonomous penetration testing framework that uses LLM-driven hier
 
 The `async_main()` function is the single entry point. It performs setup in a strict sequence:
 
-1. **Load configuration** from `.env` via `dotenv` and read environment variables (`LITELLM_MODEL`, `LITELLM_API_KEY`, `TARGET_HOST`, etc.).
+1. **Load configuration** from `.env` via `dotenv` and resolve an `LLMConfig` from `LLM_PROVIDER`, `LLM_MODEL`, the provider-specific API key, and the local endpoint settings. The legacy `LITELLM_MODEL`/`LITELLM_API_KEY` pair is also supported.
 2. **Create SSH connection** (`get_ssh_connection_from_env()`) and connect to the target.
 3. **Initialize logger** with a `Rich` console for pretty output and `structlog` for JSON log files under `logs/`.
 4. **Build components:** An `ExecutorFactory` is created with the model, API key, scenario text, the SSH `execute_command` tool, and the logger. A `Planner` is created with the factory and configuration limits (max runtime, max context size, max interactions).
@@ -154,9 +154,14 @@ Provides a thin wrapper around `litellm` for unified LLM access:
 
 Converts Python callables into LLM tool definitions using `litellm.utils.function_to_dict()`. Maintains a name-to-function mapping for dispatch.
 
-### `llm_tool_call(model, api_key, tools, messages)`
+### `LLMConfig` and `llm_tool_call(model, api_key, tools, messages)`
 
 Used by both planner and executor for the main reasoning loops. Calls `litellm.completion()` with tool definitions. Returns `(response_message, costs_dict, duration_seconds)`.
+
+`LLMConfig` normalizes OpenAI, Claude, Gemini, Ollama, and OpenAI-compatible
+local servers to LiteLLM model names and optional `api_base` settings. It is
+shared by the planner and all executors, so switching providers does not
+change the agent workflow.
 
 ### `llm_call(model, api_key, messages)`
 

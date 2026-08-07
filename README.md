@@ -62,7 +62,7 @@ Context window management is built-in: when the planner's history grows too larg
 - Python 3.12+
 - A target environment/testbed (I am using [GOAD](https://github.com/Orange-Cyberdefense/GOAD))
 - SSH access to a Linux attacker VM (e.g., Kali) inside the testbed
-- An LLM API key ([OpenRouter](https://openrouter.ai/) recommended for easy model switching)
+- Access to an LLM API, or a local tool-calling LLM server (Ollama, LM Studio, vLLM, etc.)
 
 ### Install
 
@@ -76,9 +76,11 @@ cd cochise
 Create a `.env` file:
 
 ```bash
-# LLM configuration (using OpenRouter for easy model switching)
-LITELLM_MODEL='openrouter/google/gemini-3-flash-preview'
-LITELLM_API_KEY='sk-or-...'
+# LLM configuration
+# Choose one provider: openai, claude, gemini, or local.
+LLM_PROVIDER='openai'
+LLM_MODEL='gpt-4o'
+OPENAI_API_KEY='sk-...'
 
 # SSH connection to your attacker VM
 TARGET_HOST='192.168.56.100'
@@ -91,7 +93,46 @@ PLANNER_MAX_CONTEXT_SIZE=250000    # compact history at N tokens
 PLANNER_MAX_INTERACTIONS=0         # max planner rounds (0 = unlimited) before history compaction
 ```
 
-LiteLLM supports [100+ LLM providers](https://docs.litellm.ai/docs/providers) out of the box so you can directly integrate OpenAI, Anthropic, Ollama, etc. too.
+Cochise uses LiteLLM underneath, so the planner and executor use the same
+provider connection and tool-calling interface. The supported provider
+configurations are:
+
+```bash
+# OpenAI
+LLM_PROVIDER='openai'
+LLM_MODEL='gpt-4o'
+OPENAI_API_KEY='sk-...'
+
+# Claude / Anthropic
+LLM_PROVIDER='claude'
+LLM_MODEL='claude-sonnet-4-5'
+ANTHROPIC_API_KEY='sk-ant-...'
+
+# Gemini
+LLM_PROVIDER='gemini'
+LLM_MODEL='gemini-2.5-flash'
+GEMINI_API_KEY='...'
+
+# Local Ollama (no API key required)
+LLM_PROVIDER='local'
+LOCAL_LLM_BACKEND='ollama'
+LLM_MODEL='llama3.1'
+LOCAL_LLM_BASE_URL='http://127.0.0.1:11434'
+
+# Local OpenAI-compatible server, e.g. LM Studio, vLLM, or llama.cpp
+LLM_PROVIDER='local'
+LOCAL_LLM_BACKEND='openai-compatible'
+LLM_MODEL='your-loaded-model-name'
+LOCAL_LLM_BASE_URL='http://127.0.0.1:1234/v1'
+LOCAL_LLM_API_KEY='local'
+```
+
+`LLM_BASE_URL` and `LLM_API_KEY` can be used as provider-neutral overrides.
+For backwards compatibility, `LITELLM_MODEL` and `LITELLM_API_KEY` still work
+with fully-qualified LiteLLM model names such as
+`openrouter/google/gemini-3-flash-preview`. Local models must support chat
+tool/function calling because Cochise delegates SSH and knowledge-base actions
+through tools.
 
 ### Run
 

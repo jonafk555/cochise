@@ -6,7 +6,7 @@ import pathlib
 from dotenv import load_dotenv
 from rich.console import Console
 
-from cochise.common import get_or_fail
+from cochise.common import get_llm_config_from_env
 from cochise.executor import ExecutorFactory
 from cochise.planner import Planner
 from cochise.logger import Logger
@@ -18,6 +18,10 @@ async def async_main() -> None:
 
     # setup configuration from environment variables
     load_dotenv()
+    # Resolve the selected provider once and share the same connection details
+    # with the planner and every short-lived executor.
+    llm_config = get_llm_config_from_env()
+
     conn = get_ssh_connection_from_env()
 
     # disable warnings about unknown models
@@ -28,10 +32,6 @@ async def async_main() -> None:
     logger = Logger(console)
     logger.log_data("starting test-run")
 
-    # get model data and document configuration in the logs
-    model = get_or_fail("LITELLM_MODEL")
-    api_key = get_or_fail("LITELLM_API_KEY")
-
     # when should the high-level context be compressed/compacted. The executor's
     # context will be reset with each new executor (the planner's wont).
     planner_max_context_size = int(os.getenv("PLANNER_MAX_CONTEXT_SIZE", "250000"))
@@ -41,7 +41,7 @@ async def async_main() -> None:
     max_runtime = int(os.getenv("MAX_RUN_TIME", "0"))
 
     logger.log_data("configuration", {
-        "model": model,
+        **llm_config.to_log_dict(),
         "ssh-host": conn.host,
         "ssh-user": conn.username,
         "scenario": SCENARIO,
@@ -55,8 +55,17 @@ async def async_main() -> None:
 
     # setup components..
     tools = [conn.execute_command]
-    executor_factory = ExecutorFactory(model, api_key, SCENARIO, tools, logger)
-    planner = Planner(model, api_key, SCENARIO, executor_factory, logger, max_runtime, planner_max_context_size, planner_max_interactions)
+    executor_factory = ExecutorFactory(llm_config, None, SCENARIO, tools, logger)
+    planner = Planner(
+        llm_config,
+        None,
+        SCENARIO,
+        executor_factory,
+        logger,
+        max_runtime,
+        planner_max_context_size,
+        planner_max_interactions,
+    )
 
     # ..and run cochise!
     await planner.engage()
