@@ -144,7 +144,17 @@ class Planner:
         )
         if is_stop_response(response):
             return False
-        self.logger.log_data("assessment_global_override", response, output=False)
+        if getattr(self.human_interaction, "enabled", True):
+            self.logger.log_data("assessment_global_override", response, output=False)
+        else:
+            self.logger.log_data(
+                "assessment_global_auto_override",
+                {
+                    "reason": response,
+                    "policy": "HUMAN_INTERACTION=0",
+                },
+                output=False,
+            )
         return True
 
     async def _run_pending_host_assessments(self) -> bool:
@@ -168,10 +178,17 @@ class Planner:
             )
             if is_stop_response(response):
                 return False
-            self.knowledge.override_host_assessment(host_id, response)
+            autonomous = not getattr(self.human_interaction, "enabled", True)
+            override_reason = response
+            if autonomous:
+                override_reason = (
+                    "Automatically continued because HUMAN_INTERACTION=0; "
+                    "the blocking assessment finding remains recorded."
+                )
+            self.knowledge.override_host_assessment(host_id, override_reason)
             self.logger.log_data(
-                "assessment_host_override",
-                {"host_id": host_id, "reason": response},
+                "assessment_host_auto_override" if autonomous else "assessment_host_override",
+                {"host_id": host_id, "reason": override_reason},
                 output=False,
             )
         return True

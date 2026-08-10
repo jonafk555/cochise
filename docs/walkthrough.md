@@ -26,7 +26,7 @@ The `async_main()` function is the single entry point. It performs setup in a st
 1. **Load configuration** from `.env` via `dotenv` and resolve an `LLMConfig` from `LLM_PROVIDER`, `LLM_MODEL`, the provider-specific API key, and the local endpoint settings. The legacy `LITELLM_MODEL`/`LITELLM_API_KEY` pair is also supported.
 2. **Validate LLM tool calling** with a small forced healthcheck. Planner, Executor, and assessment workers all depend on function calling.
 3. **Create SSH connection** (`get_ssh_connection_from_env()`) and connect to the target.
-4. **Initialize logger** with a `Rich` console for pretty output and `structlog` for JSON log files under `logs/`. `HUMAN_INTERACTION=0` disables stdin prompts and treats human requests as stop.
+4. **Initialize logger** with a `Rich` console for pretty output and `structlog` for JSON log files under `logs/`. `HUMAN_INTERACTION=0` disables stdin prompts and automatically continues; blocking assessment overrides are recorded in the log.
 5. **Build components:** An `ExecutorFactory` is created with the model, API key, scenario text, the SSH `execute_command` tool, and the logger. A `RangeAssessmentCoordinator` is created with the black-box adapter and optional white-box spec. A `Planner` is created with the factory, assessment coordinator, and configuration limits.
 6. **Start the run** by calling `planner.engage()`. The Planner runs the mandatory global Cyber Range preflight before creating its initial attack plan.
 
@@ -103,8 +103,10 @@ The assessment coordinator provides two mandatory gates:
    host. Findings cover OS/kernel, software, services, processes, DLLs,
    firewall/ACL behavior, AD state, and endpoint protection where observable.
 
-Blocking findings pause for human guidance. The coordinator records findings in
-Knowledge and never performs automatic range remediation.
+With human interaction enabled, blocking findings pause for human guidance. With
+`HUMAN_INTERACTION=0`, the coordinator records the finding and the Planner
+automatically overrides the gate so autonomous execution can continue. Cochise
+never performs automatic range remediation.
 
 ---
 

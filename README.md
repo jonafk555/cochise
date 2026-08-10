@@ -98,7 +98,7 @@ RANGE_SPEC_PATH=''                 # YAML/JSON spec for whitebox mode
 RANGE_NETWORKS='192.168.122.0/24' # optional comma-separated scan targets
 RANGE_CONTROL_PLANE_MODULE=''      # optional local module:factory adapter
 LLM_HEALTHCHECK=1                  # verify tool calling before preflight
-HUMAN_INTERACTION=1                # set to 0 to disable prompts; fail-closed as stop
+HUMAN_INTERACTION=1                # set to 0 to disable prompts; continue autonomously
 ```
 
 Cochise uses LiteLLM underneath, so the planner and executor use the same
@@ -149,8 +149,9 @@ platform-neutral YAML/JSON document described by
 the Planner creates an attack plan. Every newly accessed host must then pass a
 read-only inventory and attack-feasibility assessment before ordinary attack
 work continues. Blocking findings pause the run and request human guidance;
-the system does not automatically repair the range. A management-plane adapter
-can be supplied with `RANGE_CONTROL_PLANE_MODULE=module:factory`; it must
+with `HUMAN_INTERACTION=0`, the run continues autonomously and records the
+override. The system does not automatically repair the range. A management-plane
+adapter can be supplied with `RANGE_CONTROL_PLANE_MODULE=module:factory`; it must
 implement `collect_global(spec)` and `collect_host(host_id, host, spec)`.
 
 ### Run
@@ -175,8 +176,10 @@ Enter a file path, copy instructions, credentials, or another next step. Enter
 the Executor gets a short recovery window to continue.
 
 For unattended execution, set `HUMAN_INTERACTION=0`. Cochise will not read
-stdin; every human request returns `stop`, so blocking range findings stop the
-run instead of being silently overridden.
+stdin; every human request returns an autonomous continuation instruction. The
+run continues through blocking assessment findings and records the automatic
+override in the log. Use `HUMAN_INTERACTION=1` when a human must approve or
+reject a blocking finding.
 
 ## Analysis Tools
 

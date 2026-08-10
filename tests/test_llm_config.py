@@ -144,7 +144,7 @@ class LLMConfigTests(unittest.TestCase):
         self.assertFalse(is_stop_response("continue"))
         self.assertFalse(is_stop_response("contine"))
 
-    def test_disabled_human_interaction_fails_closed_without_input(self):
+    def test_disabled_human_interaction_continues_without_input(self):
         interaction = HumanInteraction(Console(), enabled=False)
         with patch("builtins.input") as input_mock:
             response = asyncio.run(
@@ -155,7 +155,8 @@ class LLMConfigTests(unittest.TestCase):
             )
 
         input_mock.assert_not_called()
-        self.assertEqual(response, "stop")
+        self.assertEqual(response, "continue autonomously")
+        self.assertFalse(is_stop_response(response))
 
     def test_missing_artifact_output_is_detected(self):
         self.assertTrue(

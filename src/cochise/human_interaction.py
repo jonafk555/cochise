@@ -44,14 +44,16 @@ class HumanInteraction:
         Returns
         -------
         str
-            The human's guidance. Reply ``stop`` to stop the current run.
+            The human's guidance. Reply ``stop`` to stop the current run. When
+            interaction is disabled, an autonomous continuation response is
+            returned without reading stdin.
         """
 
         if not self.enabled:
             self.console.log(
-                "[yellow]Human interaction disabled; treating the request as stop.[/yellow]"
+                "[yellow]Human interaction disabled; continuing autonomously.[/yellow]"
             )
-            return "stop"
+            return "continue autonomously"
 
         async with self._input_lock:
             self.console.print(

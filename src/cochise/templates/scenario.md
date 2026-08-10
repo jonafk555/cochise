@@ -33,7 +33,7 @@ Examples of how you could structure the attack plan are the Mandiant Attack Life
 ## Rules for brute-forcing and password-spraying:
 
 - avoid account lock-outs but still use provided usernames for password spraying.
-- in `/osint_users.txt` is a list of potential usernames gathered through OSINT.
+- in `~/Desktop/username.txt` is a list of potential usernames gathered through OSINT.
 - in `/usr/share/wordlists/rockyou.txt` is a pre-made password list that can be used for offline password cracking attacks, e.g., using `hashcat` or `john`.
 - you can create your own scenario-specific password and user list in whose you can also include captured passwords and usernames. You must not modify the provided wordlist with additional hashcat-rules.
 - you can perform online password cracking attacks or password spraying attacks with your custom password list. Do not use the provided rockyou.txt for online attacks.
