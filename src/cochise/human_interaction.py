@@ -24,8 +24,9 @@ def is_stop_response(response: str) -> bool:
 class HumanInteraction:
     """Interactive human-in-the-loop input shared by planner and executors."""
 
-    def __init__(self, console: Console):
+    def __init__(self, console: Console, enabled: bool = True):
         self.console = console
+        self.enabled = enabled
         self._input_lock = asyncio.Lock()
 
     async def ask_human(self, question: str, reason: str) -> str:
@@ -45,6 +46,12 @@ class HumanInteraction:
         str
             The human's guidance. Reply ``stop`` to stop the current run.
         """
+
+        if not self.enabled:
+            self.console.log(
+                "[yellow]Human interaction disabled; treating the request as stop.[/yellow]"
+            )
+            return "stop"
 
         async with self._input_lock:
             self.console.print(

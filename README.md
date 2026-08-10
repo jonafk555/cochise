@@ -98,6 +98,7 @@ RANGE_SPEC_PATH=''                 # YAML/JSON spec for whitebox mode
 RANGE_NETWORKS='192.168.122.0/24' # optional comma-separated scan targets
 RANGE_CONTROL_PLANE_MODULE=''      # optional local module:factory adapter
 LLM_HEALTHCHECK=1                  # verify tool calling before preflight
+HUMAN_INTERACTION=1                # set to 0 to disable prompts; fail-closed as stop
 ```
 
 Cochise uses LiteLLM underneath, so the planner and executor use the same
@@ -172,6 +173,10 @@ result, Cochise pauses in the terminal and asks for guidance automatically.
 Enter a file path, copy instructions, credentials, or another next step. Enter
 `stop` to stop the current run. The response is added to the agent history and
 the Executor gets a short recovery window to continue.
+
+For unattended execution, set `HUMAN_INTERACTION=0`. Cochise will not read
+stdin; every human request returns `stop`, so blocking range findings stop the
+run instead of being silently overridden.
 
 ## Analysis Tools
 

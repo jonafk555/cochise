@@ -141,6 +141,21 @@ class LLMConfigTests(unittest.TestCase):
 
         self.assertEqual(response, "/tmp/missing.txt")
         self.assertTrue(is_stop_response(" stop "))
+        self.assertFalse(is_stop_response("continue"))
+        self.assertFalse(is_stop_response("contine"))
+
+    def test_disabled_human_interaction_fails_closed_without_input(self):
+        interaction = HumanInteraction(Console(), enabled=False)
+        with patch("builtins.input") as input_mock:
+            response = asyncio.run(
+                interaction.ask_human(
+                    "Provide guidance",
+                    "The automated agent is blocked.",
+                )
+            )
+
+        input_mock.assert_not_called()
+        self.assertEqual(response, "stop")
 
     def test_missing_artifact_output_is_detected(self):
         self.assertTrue(

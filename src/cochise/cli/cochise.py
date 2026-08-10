@@ -51,7 +51,8 @@ async def async_main() -> None:
     # setup logging and console output
     console = Console()
     logger = Logger(console)
-    human_interaction = HumanInteraction(console)
+    human_interaction_enabled = _env_flag("HUMAN_INTERACTION", True)
+    human_interaction = HumanInteraction(console, enabled=human_interaction_enabled)
     logger.log_data("starting test-run")
 
     if _env_flag("LLM_HEALTHCHECK", True):
@@ -84,6 +85,7 @@ async def async_main() -> None:
         "max_runtime": max_runtime,
         "planner_max_context_size": planner_max_context_size,
         "planner_max_interactions": planner_max_interactions,
+        "human_interaction": human_interaction_enabled,
     }, output=False)
 
     # open SSH connection

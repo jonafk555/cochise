@@ -202,49 +202,105 @@ class Executor:
                 history.append(message_to_json(response_message))
 
             if is_tool_call(response_message):
+                # Keep the live progress renderer away from stdin.  Asking for
+                # human input while Progress is active causes its refreshes to
+                # redraw the input line, which makes a valid response such as
+                # ``continue`` appear to be ignored in an interactive terminal.
+                tool_calls = []
+                tool_results = {}
+                for tool_call in response_message.tool_calls:
+                    function_name = tool_call.function.name
+                    args = json.loads(tool_call.function.arguments)
+                    tool_calls.append((tool_call, function_name, args))
+                    self.logger.log_tool_call(function_name, tool_call.id, args, output=False)
 
-                tasks = []
-                display = {}
+                command_calls = [
+                    item for item in tool_calls if item[1] != "ask_human"
+                ]
+                if command_calls:
+                    tasks = []
+                    display = {}
+                    with Progress(
+                        SpinnerColumn(),
+                        TextColumn("[progress.description]{task.description}"),
+                        BarColumn(),
+                        TimeElapsedColumn(),
+                        console=self.logger.console,
+                    ) as progress:
+                        for tool_call, function_name, args in command_calls:
+                            cmd = args['command'] if 'command' in args else function_name
+                            display[tool_call.id] = progress.add_task(
+                                f"[bold green]Executing `{cmd}`", total=100
+                            )
+                            tasks.append(asyncio.create_task(
+                                perform_tool_call(
+                                    tool_call.id,
+                                    function_name,
+                                    tools.get_function(function_name),
+                                    args,
+                                )
+                            ))
 
-                with Progress(SpinnerColumn(),
-                            TextColumn("[progress.description]{task.description}"),
-                            BarColumn(),
-                            TimeElapsedColumn(),
-                            console=self.logger.console
-                            ) as progress:
-                    
-                    # IDEA: maybe not parallelize to make code simpler? Would be
-                    # IDEA: annoying as parallel network scans would take longer
-                    for tool_call in response_message.tool_calls:
-                        function_name = tool_call.function.name
-                        args = json.loads(tool_call.function.arguments)
+                        for done in asyncio.as_completed(tasks):
+                            result = await done
+                            tool_results[result['tool_call_id']] = result
+                            task_id = display[result['tool_call_id']]
+                            progress.update(task_id, advance=100)
+                            if result['tool'] == 'execute_command':
+                                progress.console.print(
+                                    Panel(
+                                        result['result'],
+                                        title=f"Tool Result for {result['cmd']}",
+                                    ),
+                                    markup=False,
+                                )
 
-                        if 'command' in args:
-                            cmd = args['command']
-                        else:
-                            cmd = function_name
+                # Human prompts must run after Progress has released the
+                # terminal.  They are still represented as normal tool results
+                # so the assistant tool-call/result ordering remains valid.
+                for tool_call, function_name, args in tool_calls:
+                    if function_name == "ask_human":
+                        tool_results[tool_call.id] = await perform_tool_call(
+                            tool_call.id,
+                            function_name,
+                            tools.get_function(function_name),
+                            args,
+                        )
 
-                        display[tool_call.id] = progress.add_task(f"[bold green]Executing `{cmd}`", total=100)
-                        self.logger.log_tool_call(function_name, tool_call.id, args, output=False)
-                        tasks.append(asyncio.create_task(perform_tool_call(tool_call.id, function_name, tools.get_function(function_name), args)))
+                # Append results in the same order as the assistant's tool
+                # calls.  In particular, never insert a user message before a
+                # required tool result.
+                for tool_call, _function_name, _args in tool_calls:
+                    result = tool_results[tool_call.id]
+                    self.logger.log_tool_result(
+                        result['tool'],
+                        result['tool_call_id'],
+                        result['result'],
+                        output=False,
+                    )
+                    msg = {
+                        "tool_call_id": result['tool_call_id'],
+                        "role": "tool",
+                        "name": result['tool'],
+                        "content": result['result'],
+                    }
+                    history.append(msg)
+                    self.logger.log_append_to_history(msg, source='agent', output=False)
 
-                    for done in asyncio.as_completed(tasks):
-                        result = await done
+                # An explicit ask_human call takes precedence over the
+                # automatic missing-artifact prompt for this response.
+                for _tool_call, _function_name, _args in tool_calls:
+                    result = tool_results[_tool_call.id]
+                    if result['tool'] == 'ask_human':
+                        human_asked = True
+                        if is_stop_response(result['result']):
+                            human_stopped = True
 
-                        task_id = display[result['tool_call_id']]
-
-                        progress.update(task_id, advance=100)
-                        if result['tool'] == 'execute_command':
-                            progress.console.print(Panel(result['result'], title=f"Tool Result for {result['cmd']}"), markup=False)
-                        self.logger.log_tool_result(result['tool'],result['tool_call_id'], result['result'], output=False)
-
-                        if result['tool'] == 'ask_human':
-                            human_asked = True
-                            if is_stop_response(result['result']):
-                                human_stopped = True
-                        elif (
+                if not human_stopped and not human_asked:
+                    for _tool_call, _function_name, _args in tool_calls:
+                        result = tool_results[_tool_call.id]
+                        if (
                             result['tool'] == 'execute_command'
-                            and not human_asked
                             and looks_like_missing_artifact(result['cmd'], result['result'])
                         ):
                             human_asked = True
@@ -270,20 +326,10 @@ class Executor:
                             )
                             if is_stop_response(human_response):
                                 human_stopped = True
+                            break
 
-                        # IDEA: when executing commands, we get an exit-code, use this to
-                        # IDEA: to detect errors.
-                        msg = {
-                            "tool_call_id": result['tool_call_id'],
-                            "role": "tool",
-                            "name": result['tool'],
-                            "content": result['result'],
-                        }
-                        history.append(msg)
-                        self.logger.log_append_to_history(msg, source='agent', output=False)
-
-                    if human_stopped:
-                        break
+                if human_stopped:
+                    break
             else:
                 # the AI message has not tool_call -> this was some sort of result then
                 if response_message.content is None or response_message.content == '':
