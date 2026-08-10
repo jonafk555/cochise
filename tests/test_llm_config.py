@@ -1,9 +1,14 @@
+import asyncio
 import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from rich.console import Console
+
 from cochise import common
+from cochise.executor import looks_like_missing_artifact
+from cochise.human_interaction import HumanInteraction, is_stop_response
 
 
 class LLMConfigTests(unittest.TestCase):
@@ -98,6 +103,53 @@ class LLMConfigTests(unittest.TestCase):
         self.assertNotIn("api_key", captured)
         self.assertEqual(captured["api_base"], "http://127.0.0.1:11434")
         self.assertEqual(costs["total_tokens"], 5)
+
+    def test_llm_healthcheck_requires_a_tool_call(self):
+        captured = {}
+
+        def fake_completion(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(
+                    role="assistant",
+                    content="",
+                    tool_calls=[SimpleNamespace(id="1", function=SimpleNamespace(
+                        name="_llm_healthcheck_tool",
+                        arguments='{"status":"ok"}',
+                    ))],
+                ))],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+                _hidden_params={},
+            )
+
+        config = common.LLMConfig(provider="local", model="ollama/test")
+        with patch.object(common.litellm, "completion", fake_completion):
+            costs, _duration = common.check_llm_tool_calling(config, None)
+
+        self.assertEqual(captured["tool_choice"]["type"], "function")
+        self.assertEqual(costs["total_tokens"], 2)
+
+    def test_human_input_is_returned_and_stop_is_recognized(self):
+        interaction = HumanInteraction(Console())
+        with patch("builtins.input", return_value="/tmp/missing.txt"):
+            response = asyncio.run(
+                interaction.ask_human(
+                    "Where should I look for the missing file?",
+                    "The expected artifact was not found.",
+                )
+            )
+
+        self.assertEqual(response, "/tmp/missing.txt")
+        self.assertTrue(is_stop_response(" stop "))
+
+    def test_missing_artifact_output_is_detected(self):
+        self.assertTrue(
+            looks_like_missing_artifact(
+                "cat /tmp/expected.txt",
+                "cat: /tmp/expected.txt: No such file or directory",
+            )
+        )
+        self.assertFalse(looks_like_missing_artifact("nmap 127.0.0.1", "host is up"))
 
 
 if __name__ == "__main__":

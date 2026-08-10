@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Cochise Cyber Range specification",
+  "type": "object",
+  "description": "Platform-neutral white-box facts used to assess a Cyber Range.",
+  "properties": {
+    "scenario_ref": { "type": "string" },
+    "segments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" },
+          "label": { "type": "string" },
+          "cidr": { "type": "string" },
+          "network": { "type": "string" },
+          "expected_acl": { "type": ["array", "object", "string"] },
+          "expected_firewall": { "type": ["array", "object", "string"] }
+        }
+      }
+    },
+    "networks": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          { "type": "string" },
+          {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "cidr": { "type": "string" },
+              "network": { "type": "string" },
+              "expected_acl": { "type": ["array", "object", "string"] },
+              "expected_firewall": { "type": ["array", "object", "string"] }
+            }
+          }
+        ]
+      }
+    },
+    "hosts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" },
+          "hostname": { "type": "string" },
+          "ip": { "type": "string" },
+          "ips": { "type": "array", "items": { "type": "string" } },
+          "ip_addresses": { "type": "array", "items": { "type": "string" } },
+          "role": { "type": "string" },
+          "platform": { "type": ["object", "string"] },
+          "os": { "type": ["object", "string"] },
+          "software": { "type": ["array", "object"] },
+          "services": { "type": ["array", "object"] },
+          "expected_acl": { "type": ["array", "object", "string"] },
+          "expected_firewall": { "type": ["array", "object", "string"] },
+          "expected_endpoint_protection": { "type": ["array", "object", "string"] },
+          "expected_ad": { "type": ["array", "object", "string"] }
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

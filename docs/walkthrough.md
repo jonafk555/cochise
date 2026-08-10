@@ -6,13 +6,14 @@ Cochise is an autonomous penetration testing framework that uses LLM-driven hier
 
 1. [Entry Point: `cli/cochise.py`](#1-entry-point)
 2. [Planner: `planner.py`](#2-planner)
-3. [Executor: `executor.py`](#3-executor)
-4. [Knowledge Base: `knowledge.py`](#4-knowledge-base)
-5. [LLM Interface: `common.py`](#5-llm-interface)
-6. [SSH Connection: `ssh_connection.py`](#6-ssh-connection)
-7. [Logging: `logger.py`](#7-logging)
-8. [Templates](#8-templates)
-9. [Control Flow Diagram](#9-control-flow-diagram)
+3. [Cyber Range Assessment: `assessment.py`](#3-cyber-range-assessment)
+4. [Executor: `executor.py`](#4-executor)
+5. [Knowledge Base: `knowledge.py`](#5-knowledge-base)
+6. [LLM Interface: `common.py`](#6-llm-interface)
+7. [SSH Connection: `ssh_connection.py`](#7-ssh-connection)
+8. [Logging: `logger.py`](#8-logging)
+9. [Templates](#9-templates)
+10. [Control Flow Diagram](#10-control-flow-diagram)
 
 ---
 
@@ -23,10 +24,11 @@ Cochise is an autonomous penetration testing framework that uses LLM-driven hier
 The `async_main()` function is the single entry point. It performs setup in a strict sequence:
 
 1. **Load configuration** from `.env` via `dotenv` and resolve an `LLMConfig` from `LLM_PROVIDER`, `LLM_MODEL`, the provider-specific API key, and the local endpoint settings. The legacy `LITELLM_MODEL`/`LITELLM_API_KEY` pair is also supported.
-2. **Create SSH connection** (`get_ssh_connection_from_env()`) and connect to the target.
-3. **Initialize logger** with a `Rich` console for pretty output and `structlog` for JSON log files under `logs/`.
-4. **Build components:** An `ExecutorFactory` is created with the model, API key, scenario text, the SSH `execute_command` tool, and the logger. A `Planner` is created with the factory and configuration limits (max runtime, max context size, max interactions).
-5. **Start the run** by calling `planner.engage()`.
+2. **Validate LLM tool calling** with a small forced healthcheck. Planner, Executor, and assessment workers all depend on function calling.
+3. **Create SSH connection** (`get_ssh_connection_from_env()`) and connect to the target.
+4. **Initialize logger** with a `Rich` console for pretty output and `structlog` for JSON log files under `logs/`.
+5. **Build components:** An `ExecutorFactory` is created with the model, API key, scenario text, the SSH `execute_command` tool, and the logger. A `RangeAssessmentCoordinator` is created with the black-box adapter and optional white-box spec. A `Planner` is created with the factory, assessment coordinator, and configuration limits.
+6. **Start the run** by calling `planner.engage()`. The Planner runs the mandatory global Cyber Range preflight before creating its initial attack plan.
 
 The scenario text is loaded at import time from `templates/scenario.md` and describes the penetration test objective (Active Directory domain dominance on 192.168.122.0/24).
 
@@ -40,14 +42,14 @@ The Planner is the strategic brain. It maintains a conversation history with the
 
 ### 2.1 Initial Plan Creation (`create_initial_plan`)
 
-- Renders the `ptt_update.md.jinja2` template with an empty plan and no prior results.
+- Renders the planner structure and current Cyber Range assessment context.
 - Calls `llm_call()` (a simple LLM completion, no tools) asking the LLM to produce a tree-structured task plan.
 - Returns the plan text.
 
 ### 2.2 Main Loop (`engage`)
 
 Sets up the initial conversation history as four messages:
-1. **System:** scenario + plan structure rules (`planner_ptt.md`)
+1. **System:** scenario + plan structure rules (`planner_structure.md`)
 2. **User:** "Create me an initial plan..."
 3. **Assistant:** the generated plan (from step 2.1)
 4. **User:** the selection prompt (`planner_prompt.md`) asking which task to execute next
@@ -56,21 +58,23 @@ Then enters the main loop (bounded by `max_runtime`):
 
 **Each round:**
 
-1. **Check compaction triggers:** If `max_interactions` exceeded or `last_input_tokens >= max_context_size`, call `compact_history()` to summarize and reset the conversation.
-2. **Build a fresh Executor** via `executor_factory.build(self.knowledge)`. Each executor starts with no memory of previous rounds but receives the current knowledge base.
-3. **Register tools** as an `LLMFunctionMapping`:
+1. **Run pending host assessments:** Any newly registered host is assessed before ordinary attack work continues. Blocking results pause for human guidance.
+2. **Check compaction triggers:** If `max_interactions` exceeded or `last_input_tokens >= max_context_size`, call `compact_history()` to summarize and reset the conversation.
+3. **Build a fresh Executor** via `executor_factory.build(self.knowledge)`. Each executor starts with no memory of previous rounds but receives the current knowledge base.
+4. **Register tools** as an `LLMFunctionMapping`:
    - `executor.perform_task` -- delegate a subtask to the executor
    - `knowledge.add_compromised_account` -- store a found credential
    - `knowledge.update_compromised_account` -- update an existing credential
    - `knowledge.add_entity_information` -- store recon findings
    - `knowledge.update_entity_information` -- update recon findings
-4. **Call LLM** with `llm_tool_call()`, passing the history and tool definitions. The LLM selects a task and calls the appropriate tool.
-5. **Process tool calls:** For each tool call in the response:
+   - `knowledge.register_host_access` -- mark a newly accessed host for mandatory assessment
+5. **Call LLM** with `llm_tool_call()`, passing the history and tool definitions. The LLM selects a task and calls the appropriate tool.
+6. **Process tool calls:** For each tool call in the response:
    - Execute the function (e.g., `executor.perform_task(...)` which runs the full executor loop).
    - If the result is a tuple `(summary, knowledge)` (from the executor), merge the returned knowledge into the planner's knowledge and log it.
    - Append the tool result to the conversation history.
-6. **Handle non-tool responses:** If the LLM responds with text instead of a tool call, append a "please continue" user message and retry.
-7. **Increment interaction counter** and loop.
+7. **Handle non-tool responses:** If the LLM responds with text instead of a tool call, append a "please continue" user message and retry.
+8. **Increment interaction counter** and loop.
 
 ### 2.3 History Compaction (`compact_history`)
 
@@ -83,7 +87,28 @@ This keeps the context window bounded while preserving strategic state.
 
 ---
 
-## 3. Executor
+## 3. Cyber Range Assessment
+
+**File:** `src/cochise/assessment.py`
+
+The assessment coordinator provides two mandatory gates:
+
+1. A global black-box preflight runs from the attacker VM before the initial
+   Planner plan. It records interface, route, DNS, and configured network
+   reachability evidence. A white-box YAML/JSON spec can add expected topology
+   and host facts.
+2. The Executor calls `register_host_access` after confirming a newly accessed
+   host. Before the Planner selects another ordinary task, an assessment worker
+   performs read-only inventory and then attack-feasibility validation for that
+   host. Findings cover OS/kernel, software, services, processes, DLLs,
+   firewall/ACL behavior, AD state, and endpoint protection where observable.
+
+Blocking findings pause for human guidance. The coordinator records findings in
+Knowledge and never performs automatic range remediation.
+
+---
+
+## 4. Executor
 
 **File:** `src/cochise/executor.py`
 
@@ -101,9 +126,9 @@ Parameters received from the planner: `next_step`, `next_step_context`, `mitre_a
 1. Renders `executor_prompt.md.jinja2` with the task details and current knowledge.
 2. Creates a two-message history: system (scenario) + user (rendered prompt).
 3. Creates a **local** `Knowledge()` instance (separate from the planner's).
-4. Registers tools: all configured tools (SSH `execute_command`) plus the four knowledge mutation methods on the local knowledge.
+4. Registers tools: all configured tools (SSH `execute_command`) plus host registration, human guidance, and knowledge mutation methods on the local knowledge.
 
-**Execution loop** (up to `MAX_ROUNDS=10`):
+**Execution loop** (up to `MAX_ROUNDS=25`, plus the configured human recovery window):
 1. Call `llm_tool_call()` with the executor's local history.
 2. If the response contains tool calls:
    - Execute **all tool calls in parallel** using `asyncio.create_task()` and `asyncio.as_completed()`. This is key for performance when running multiple SSH commands.
@@ -118,7 +143,7 @@ Parameters received from the planner: `next_step`, `next_step_context`, `mitre_a
 
 ---
 
-## 4. Knowledge Base
+## 5. Knowledge Base
 
 **File:** `src/cochise/knowledge.py`
 
@@ -126,6 +151,8 @@ A simple in-memory store with two dictionaries and an auto-incrementing counter:
 
 - **`compromised_accounts`**: keyed by ID, stores `{username, password, context, dirty}`.
 - **`entity_information`**: keyed by ID, stores `{entity, information, dirty}`.
+- **`hosts`**: keyed by host ID, tracks confirmed access and assessment-gate state.
+- **`assessment_findings`**: structured black-box/white-box evidence and severity.
 
 ### Key Operations
 
@@ -137,6 +164,8 @@ A simple in-memory store with two dictionaries and an auto-incrementing counter:
 | `update_entity_information` | LLM via tool call | Update existing recon info |
 | `merge(other)` | Planner, after executor returns | Copy dirty entries from executor's local knowledge into the planner's global knowledge |
 | `get_knowledge()` | Planner/Executor prompts | Render all knowledge as markdown tables for LLM context |
+| `register_host_access` | Executor via tool call | Mark a newly accessed host as pending assessment |
+| `record_assessment_result` | Assessment coordinator | Persist findings and complete a host gate |
 
 ### Dirty Flag Mechanism
 
@@ -144,7 +173,7 @@ The `dirty` flag tracks which entries are new or modified. When an executor adds
 
 ---
 
-## 5. LLM Interface
+## 6. LLM Interface
 
 **File:** `src/cochise/common.py`
 
@@ -163,6 +192,15 @@ local servers to LiteLLM model names and optional `api_base` settings. It is
 shared by the planner and all executors, so switching providers does not
 change the agent workflow.
 
+`check_llm_tool_calling()` performs the startup provider capability check. It
+uses a forced no-op function call, so a model/server without tool calling fails
+before Cyber Range assessment begins.
+
+The `ask_human` tool is registered for both planner and executor. It pauses
+the terminal without blocking the event loop, appends the response to the
+current conversation, and lets the model continue. The executor also asks
+automatically after exhausting its normal command-selection rounds.
+
 ### `llm_call(model, api_key, messages)`
 
 Used for simple completions without tools (initial plan creation, history compaction, forced executor summaries). Returns `(content_dict, duration, costs)` where `content_dict` contains `content` and `reasoning_content` fields.
@@ -176,7 +214,7 @@ Used for simple completions without tools (initial plan creation, history compac
 
 ---
 
-## 6. SSH Connection
+## 7. SSH Connection
 
 **File:** `src/cochise/ssh_connection.py`
 
@@ -188,7 +226,7 @@ A dataclass wrapping `asyncssh` for command execution on the target:
 
 ---
 
-## 7. Logging
+## 8. Logging
 
 **File:** `src/cochise/logger.py`
 
@@ -200,19 +238,20 @@ Log event types: `log_data`, `log_llm_call` (with costs/duration), `log_tool_cal
 
 ---
 
-## 8. Templates
+## 9. Templates
 
 | Template | Used by | Purpose |
 |----------|---------|---------|
 | `scenario.md` | Entry point | Defines the pentest objective, rules, and tool guidance |
-| `planner_ptt.md` | Planner (system prompt, compaction) | Rules for tree-structured task plan maintenance |
+| `planner_structure.md` | Planner (system prompt, compaction) | Rules for tree-structured task plan maintenance |
 | `planner_prompt.md` | Planner (user prompt each round) | Instructions to select the next task |
-| `ptt_update.md.jinja2` | Planner (`create_initial_plan`, `compact_history`) | Template for plan generation with Jinja2 variables |
 | `executor_prompt.md.jinja2` | Executor (`perform_task`) | Task prompt with step details, context, and knowledge |
+| `assessment_prompt.md.jinja2` | Assessment worker | Read-only host inventory and attack-feasibility assessment |
+| `range_spec.schema.json` | White-box configuration | Platform-neutral Cyber Range spec shape |
 
 ---
 
-## 9. Control Flow Diagram
+## 10. Control Flow Diagram
 
 This diagram shows how `cli/cochise.py` (the entry point), the `Planner`, and the `Executor` interact at runtime. The planner runs a persistent loop, building a fresh executor each round and delegating one task at a time. The executor runs its own inner loop of LLM reasoning and SSH command execution, then returns results to the planner.
 

@@ -325,14 +325,19 @@ def llm_tool_call(
     model: str | LLMConfig,
     api_key: str | None,
     tools: LLMFunctionMapping,
-    messages: list[dict[str, Any]]):
+    messages: list[dict[str, Any]],
+    tool_choice: dict[str, Any] | str | None = None,
+):
 
     tik = datetime.datetime.now()
-    response = litellm.completion(
-        messages=messages,
-        tools=tools.get_tool_definitions(),
+    completion_kwargs = {
+        "messages": messages,
+        "tools": tools.get_tool_definitions(),
         **_completion_kwargs(model, api_key),
-    )
+    }
+    if tool_choice is not None:
+        completion_kwargs["tool_choice"] = tool_choice
+    response = litellm.completion(**completion_kwargs)
     tok = datetime.datetime.now()
 
     if len(response.choices) != 1:
@@ -343,6 +348,45 @@ def llm_tool_call(
     duration = (tok - tik).total_seconds()
 
     return response_message, costs, duration
+
+
+def _llm_healthcheck_tool(status: str = "ok") -> str:
+    """Return a value used only to verify that function calling is available."""
+
+    return status
+
+
+def check_llm_tool_calling(
+    model: str | LLMConfig,
+    api_key: str | None,
+) -> tuple[dict[str, Any], float]:
+    """Perform a small forced tool call and verify the configured model contract.
+
+    Planner and Executor both depend on tool calls.  Failing early gives a
+    useful provider/model error instead of allowing a run to stall after an
+    expensive Cyber Range preflight.
+    """
+
+    tools = LLMFunctionMapping([_llm_healthcheck_tool])
+    response_message, costs, duration = llm_tool_call(
+        model,
+        api_key,
+        tools,
+        [{
+            "role": "user",
+            "content": "Call the healthcheck tool exactly once with status='ok'.",
+        }],
+        tool_choice={
+            "type": "function",
+            "function": {"name": "_llm_healthcheck_tool"},
+        },
+    )
+    if not is_tool_call(response_message):
+        raise RuntimeError(
+            "The configured LLM returned no tool call during healthcheck. "
+            "Use a model/server with chat function calling support."
+        )
+    return costs, duration
 
 
 def message_to_json(message):

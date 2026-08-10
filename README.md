@@ -91,6 +91,13 @@ TARGET_PASSWORD='kali'
 MAX_RUN_TIME=7200                  # stop after N seconds (0 = unlimited), this is best effort not a hard limit
 PLANNER_MAX_CONTEXT_SIZE=250000    # compact history at N tokens
 PLANNER_MAX_INTERACTIONS=0         # max planner rounds (0 = unlimited) before history compaction
+
+# Cyber Range assessment
+RANGE_MODE='blackbox'              # blackbox or whitebox
+RANGE_SPEC_PATH=''                 # YAML/JSON spec for whitebox mode
+RANGE_NETWORKS='192.168.122.0/24' # optional comma-separated scan targets
+RANGE_CONTROL_PLANE_MODULE=''      # optional local module:factory adapter
+LLM_HEALTHCHECK=1                  # verify tool calling before preflight
 ```
 
 Cochise uses LiteLLM underneath, so the planner and executor use the same
@@ -134,6 +141,17 @@ with fully-qualified LiteLLM model names such as
 tool/function calling because Cochise delegates SSH and knowledge-base actions
 through tools.
 
+Cyber Range assessment is mandatory. Black-box mode collects evidence from the
+attacker VM; white-box mode additionally compares observations with the
+platform-neutral YAML/JSON document described by
+`src/cochise/templates/range_spec.schema.json`. A global preflight runs before
+the Planner creates an attack plan. Every newly accessed host must then pass a
+read-only inventory and attack-feasibility assessment before ordinary attack
+work continues. Blocking findings pause the run and request human guidance;
+the system does not automatically repair the range. A management-plane adapter
+can be supplied with `RANGE_CONTROL_PLANE_MODULE=module:factory`; it must
+implement `collect_global(spec)` and `collect_host(host_id, host, spec)`.
+
 ### Run
 
 Before you run it, check `src/cochise/templates/scenario.md`. This file contains generic instructions
@@ -145,6 +163,15 @@ uv run cochise
 ```
 
 Cochise will create a timestamped JSON log in `logs/` capturing every LLM call, command execution, and discovered credential.
+
+### Human-in-the-loop
+
+The agent can call `ask_human` when it is blocked or cannot find an expected
+file/artifact. If an Executor reaches its normal 25-round limit without a
+result, Cochise pauses in the terminal and asks for guidance automatically.
+Enter a file path, copy instructions, credentials, or another next step. Enter
+`stop` to stop the current run. The response is added to the agent history and
+the Executor gets a short recovery window to continue.
 
 ## Analysis Tools
 
@@ -180,6 +207,7 @@ The codebase is structured for readability, not abstraction. The core files (I a
 | `knowledge.py` | 73 | Credential & entity tracking |
 | `common.py` | 89 | LLM interface (litellm wrapper) |
 | `logger.py` | 80 | Structured JSON + Rich console logging |
+| `assessment.py` | -- | Cyber Range preflight, host gates, findings, and white-box loading |
 | `ssh_connection.py` | 37 | Async SSH with timeout and reconnect |
 
 See [walkthrough.md](docs/walkthrough.md) for a detailed code walkthrough.

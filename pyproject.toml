@@ -16,7 +16,8 @@ dependencies = [
 	"rich>=14.3.3",
 	"structlog>=25.5.0",
 	"jinja2",
-	"python-dotenv>=1.2.2"
+	"python-dotenv>=1.2.2",
+	"pyyaml>=6.0.3"
 ]
 
 [project.scripts]

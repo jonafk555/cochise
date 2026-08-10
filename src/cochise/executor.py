@@ -7,7 +7,30 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn,TimeElapsedColumn
 
 from cochise.common import is_tool_call, LLMFunctionMapping, llm_call, llm_tool_call, message_to_json
+from cochise.human_interaction import HumanInteraction, is_stop_response
 from cochise.knowledge import Knowledge
+
+
+MISSING_ARTIFACT_MARKERS = (
+    "no such file or directory",
+    "no such file",
+    "cannot access",
+    "cannot open",
+    "file not found",
+    "not found",
+    "file does not exist",
+    "does not exist",
+    "filenotfounderror",
+)
+
+
+def looks_like_missing_artifact(command: str, output: str) -> bool:
+    command_text = str(command).lower()
+    output_text = str(output).lower()
+    if not any(marker in output_text for marker in MISSING_ARTIFACT_MARKERS):
+        return False
+    return "/" in command_text or "file" in command_text or "path" in command_text
+
 
 async def perform_tool_call(id, tool_name, function, args):
     try:
@@ -26,30 +49,64 @@ async def perform_tool_call(id, tool_name, function, args):
 TEMPLATE_DIR = pathlib.Path(__file__).parent / "templates"
 PROMPT = (TEMPLATE_DIR / "executor_prompt.md.jinja2").read_text()
 MAX_ROUNDS:int=25
+HUMAN_RECOVERY_ROUNDS:int=5
 
 class ExecutorFactory:
-    def __init__(self, model, api_key, scenario, configured_tools, logger):
+    def __init__(self, model, api_key, scenario, configured_tools, logger, human_interaction=None):
         self.model = model
         self.api_key = api_key
         self.logger = logger
         self.scenario = scenario
         self.configured_tools = configured_tools
+        self.human_interaction = human_interaction or HumanInteraction(logger.console)
 
     def build(self, system_knowledge):
-        return Executor(self.model, self.api_key, self.scenario, self.configured_tools, system_knowledge, self.logger)
+        return Executor(
+            self.model,
+            self.api_key,
+            self.scenario,
+            self.configured_tools,
+            system_knowledge,
+            self.logger,
+            self.human_interaction,
+        )
 
 class Executor:
 
-    def __init__(self, model, api_key, scenario, configured_tools, system_knowledge, logger):
+    def __init__(
+        self,
+        model,
+        api_key,
+        scenario,
+        configured_tools,
+        system_knowledge,
+        logger,
+        human_interaction=None,
+    ):
         self.model = model
         self.api_key = api_key
         self.logger = logger
         self.scenario = scenario
         self.system_knowledge = system_knowledge
         self.configured_tools = configured_tools
+        self.human_interaction = human_interaction or HumanInteraction(logger.console)
 
     def setLogger(self, logger):
         self.logger = logger
+
+    async def ask_human(self, question: str, reason: str) -> str:
+        """Ask a human for guidance when the executor is blocked or missing a file.
+
+        Parameters
+        ----------
+        question : str
+            The concrete information, file path, or next step needed from the
+            human.
+        reason : str
+            Why the executor cannot continue.
+        """
+
+        return await self.human_interaction.ask_human(question, reason)
 
     async def perform_task(self, next_step: str, next_step_context: str, mitre_attack_tactic: str, mitre_attack_technique: str) -> tuple[str, Knowledge]:
         """Perform the given task, which is a sub-task of the overall hacking objective.
@@ -87,6 +144,8 @@ class Executor:
 
         knowledge = Knowledge(self.logger)
         tools = LLMFunctionMapping(self.configured_tools + [
+            self.ask_human,
+            knowledge.register_host_access,
             knowledge.add_compromised_account,
             knowledge.update_compromised_account,
             knowledge.add_entity_information,
@@ -99,7 +158,33 @@ class Executor:
         # try to solve our sub-task
         round = 1
         summary = None
-        while round <= MAX_ROUNDS:
+        human_asked = False
+        human_stopped = False
+        max_rounds = MAX_ROUNDS + HUMAN_RECOVERY_ROUNDS
+        while round <= max_rounds:
+
+            if round == MAX_ROUNDS + 1 and not human_asked:
+                human_asked = True
+                human_response = await self.ask_human(
+                    question=(
+                        f"The executor could not complete this task after {MAX_ROUNDS} rounds:\n"
+                        f"{next_step}\n\n"
+                        "If an expected file or artifact is missing, provide its exact path, "
+                        "copy it to the Kali machine, or explain how to obtain it. Otherwise "
+                        "provide the next step or missing information. Reply 'stop' to end the run."
+                    ),
+                    reason="The executor is blocked and needs human guidance to continue.",
+                )
+                human_message = {
+                    "role": "user",
+                    "content": f"Human guidance: {human_response}",
+                }
+                history.append(human_message)
+                self.logger.log_append_to_history(human_message, source="human", output=False)
+
+                if is_stop_response(human_response):
+                    human_stopped = True
+                    break
 
             with self.logger.console.status("[bold green]executor: selecting next action"):
 
@@ -153,6 +238,39 @@ class Executor:
                             progress.console.print(Panel(result['result'], title=f"Tool Result for {result['cmd']}"), markup=False)
                         self.logger.log_tool_result(result['tool'],result['tool_call_id'], result['result'], output=False)
 
+                        if result['tool'] == 'ask_human':
+                            human_asked = True
+                            if is_stop_response(result['result']):
+                                human_stopped = True
+                        elif (
+                            result['tool'] == 'execute_command'
+                            and not human_asked
+                            and looks_like_missing_artifact(result['cmd'], result['result'])
+                        ):
+                            human_asked = True
+                            human_response = await self.ask_human(
+                                question=(
+                                    f"The command `{result['cmd']}` could not access an expected "
+                                    "file or artifact.\n\n"
+                                    f"Command output:\n{result['result'][-2000:]}\n\n"
+                                    "Provide the correct path, copy the file to the Kali machine, "
+                                    "or explain how to obtain it. Reply 'stop' to end the run."
+                                ),
+                                reason="An SSH command reported that an expected file or artifact is unavailable.",
+                            )
+                            human_message = {
+                                "role": "user",
+                                "content": f"Human guidance: {human_response}",
+                            }
+                            history.append(human_message)
+                            self.logger.log_append_to_history(
+                                human_message,
+                                source="human",
+                                output=False,
+                            )
+                            if is_stop_response(human_response):
+                                human_stopped = True
+
                         # IDEA: when executing commands, we get an exit-code, use this to
                         # IDEA: to detect errors.
                         msg = {
@@ -163,6 +281,9 @@ class Executor:
                         }
                         history.append(msg)
                         self.logger.log_append_to_history(msg, source='agent', output=False)
+
+                    if human_stopped:
+                        break
             else:
                 # the AI message has not tool_call -> this was some sort of result then
                 if response_message.content is None or response_message.content == '':
@@ -179,6 +300,9 @@ class Executor:
                     summary = response_message.content
                     break
             round = round + 1
+
+        if summary is None and human_stopped:
+            summary = "The human operator stopped the executor before the task was completed."
 
         if summary is None:
             # create new summary based on history

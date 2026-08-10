@@ -7,6 +7,7 @@ from rich.panel import Panel
 from rich.pretty import Pretty
 
 from cochise.common import LLMFunctionMapping, is_tool_call, llm_call, llm_tool_call, message_to_json
+from cochise.human_interaction import HumanInteraction, is_stop_response
 from cochise.knowledge import Knowledge
 from cochise.logger import Logger
 
@@ -17,7 +18,19 @@ PROMPT = (TEMPLATE_DIR / "planner_prompt.md").read_text()
 
 class Planner:
     
-    def __init__(self, model, model_api_key, scenario, executor_factory, logger, max_runtime:int=0, max_context_size:int=0, max_interactions:int=0):
+    def __init__(
+        self,
+        model,
+        model_api_key,
+        scenario,
+        executor_factory,
+        logger,
+        max_runtime: int = 0,
+        max_context_size: int = 0,
+        max_interactions: int = 0,
+        human_interaction=None,
+        assessment_coordinator=None,
+    ):
         self.model = model
         self.model_api_key = model_api_key
         self.scenario = scenario
@@ -26,6 +39,10 @@ class Planner:
         self.max_runtime = max_runtime
         self.max_context_size = max_context_size
         self.max_interactions = max_interactions
+        self.human_interaction = human_interaction or HumanInteraction(logger.console)
+        self.assessment_coordinator = assessment_coordinator
+        self.human_stop_requested = False
+        self.preflight_complete = False
 
         self.history = []
         self.knowledge = Knowledge(self.logger)
@@ -37,10 +54,33 @@ class Planner:
             self.PLANNER_INITIAL_STRUCTURE = PLANNER_STRUCTURE + "\n\n# Task\n\nProvide the hierarchical task plan as answer. Do not include a title or an appendix."
             self.SCENARIO_AND_STRUCTURE = self.scenario + "\n\n# Task Plan Creation and Evolution\n\n" + PLANNER_STRUCTURE
 
+    def _planner_system_context(self) -> str:
+        assessment = self.knowledge.get_knowledge()
+        if assessment:
+            return (
+                self.SCENARIO_AND_STRUCTURE
+                + "\n\n# Cyber Range Assessment Context\n\n"
+                + assessment
+            )
+        return self.SCENARIO_AND_STRUCTURE
+
+    async def ask_human(self, question: str, reason: str) -> str:
+        """Ask a human for guidance when the planner cannot choose a viable task.
+
+        Parameters
+        ----------
+        question : str
+            The missing information or decision needed from the human.
+        reason : str
+            Why the planner cannot safely continue.
+        """
+
+        return await self.human_interaction.ask_human(question, reason)
+
     # IDEA: unify with compact_history
     def create_initial_plan(self) -> str:
         tmp_history = [
-            {"role": "system", "content": self.scenario},
+            {"role": "system", "content": self._planner_system_context()},
             {"role": "user", "content": self.PLANNER_INITIAL_STRUCTURE }
         ]
         self.logger.log_append_to_history(tmp_history, "manual", False)
@@ -65,12 +105,76 @@ class Planner:
         self.logger.console.print(Panel(plan, title="new plan"))
 
         self.history = [
-            { "role": "system", "content": self.SCENARIO_AND_STRUCTURE},
+            { "role": "system", "content": self._planner_system_context()},
             { "role": "user", "content": "Create me an initial plan to achieve the overall objective. Break down the overall objective into smaller tasks and subtasks. Do not include generic steps, only very specific ones that are directly relevant for achieving the overall objective. Be concise." },
             { "role": "assistant", "content": f"# Initial Plan\n\n{plan}\n\n\n # Gathered Findings\n\n{self.knowledge.get_knowledge()}" },
             { "role": "user", "content": PROMPT } # always finish with user prompt
         ]
         self.logger.log_append_to_history(self.history, "manual", False)
+
+    def _append_assessment_to_history(self, result) -> None:
+        message = {
+            "role": "user",
+            "content": (
+                f"Cyber Range assessment completed for {result.target}.\n"
+                f"Status: {result.status}.\n"
+                f"Summary: {result.summary}\n"
+                "Use the structured findings in the current knowledge context."
+            ),
+        }
+        self.history.append(message)
+        self.logger.log_append_to_history(message, "assessment", output=False)
+
+    async def _run_global_preflight(self) -> bool:
+        if self.assessment_coordinator is None or self.preflight_complete:
+            return True
+
+        result = await self.assessment_coordinator.run_global_preflight(self.knowledge)
+        self.preflight_complete = True
+        if not result.is_blocking:
+            return True
+
+        response = await self.ask_human(
+            question=(
+                "The Cyber Range global preflight has blocking findings. "
+                "Review the assessment evidence and provide a correction or reply 'stop' "
+                "to end the run."
+            ),
+            reason="The Cyber Range is not ready according to the global assessment gate.",
+        )
+        if is_stop_response(response):
+            return False
+        self.logger.log_data("assessment_global_override", response, output=False)
+        return True
+
+    async def _run_pending_host_assessments(self) -> bool:
+        if self.assessment_coordinator is None:
+            return True
+
+        for host_id in list(self.knowledge.get_pending_hosts()):
+            result = await self.assessment_coordinator.assess_host(host_id, self.knowledge)
+            if result is None:
+                continue
+            self._append_assessment_to_history(result)
+            if not result.is_blocking:
+                continue
+
+            response = await self.ask_human(
+                question=(
+                    f"Host assessment for {host_id} has blocking findings. "
+                    "Provide a correction or reply 'stop' to stop the run."
+                ),
+                reason="A newly accessed host failed the mandatory Cyber Range assessment gate.",
+            )
+            if is_stop_response(response):
+                return False
+            self.knowledge.override_host_assessment(host_id, response)
+            self.logger.log_data(
+                "assessment_host_override",
+                {"host_id": host_id, "reason": response},
+                output=False,
+            )
+        return True
 
     async def handle_tool_calls(self, response_message, executor, tool_mapping):
         for tool_call in response_message.tool_calls:
@@ -117,6 +221,9 @@ class Planner:
                 result = raw_result
                 new_knowledge = Knowledge(self.logger)
 
+            if function_name == "ask_human" and is_stop_response(str(result)):
+                self.human_stop_requested = True
+
             self.logger.log_tool_result(function_name, tool_call.id, result, output=False)
             msg = {
                 "role": "tool",
@@ -133,17 +240,28 @@ class Planner:
         """Engage the planner to select the next task to perform based on the current plan and knowledge. This will be called in a loop until the overall objective is achieved.
         """
 
+        if self.assessment_coordinator is None:
+            raise RuntimeError(
+                "Cyber Range assessment coordinator is required before the Planner can engage."
+            )
+
         # used for stopping and compaction logic
         interaction_counter = 0 # this is currently a round-counter actually
         last_input_tokens = 0
+        non_tool_response_counter = 0
+        human_stopped = False
         started = datetime.datetime.now()
+
+        if not await self._run_global_preflight():
+            self.logger.log_data("completed", "Global Cyber Range preflight stopped the run.", output=True)
+            return
 
         # create an initial plan and select the first task 
         with self.logger.console.status("[bold green]llm-call: creating initial plan"):
             plan = self.create_initial_plan()
 
         self.history = [
-            { "role": "system", "content": self.scenario + "\n\n# Task Plan Creation and Evolution\n\n" + PLANNER_STRUCTURE },
+            { "role": "system", "content": self._planner_system_context() },
             { "role": "user", "content": "Create me an initial plan to achieve the overall objective. Break down the overall objective into smaller tasks and subtasks. Do not include generic steps, only very specific ones that are directly relevant for achieving the overall objective. Be concise." },
             { "role": "assistant", "content": f"# Initial Plan\n\n{plan}" },
             { "role": "user", "content": PROMPT } # always finish with user prompt
@@ -153,6 +271,10 @@ class Planner:
         # IDEA: I could use a progress bar to show the remaining runtime
         # IDEA: I could also output the currently used context size
         while( self.max_runtime == 0 or (datetime.datetime.now()- started).total_seconds() <= self.max_runtime):
+
+            if not await self._run_pending_host_assessments():
+                human_stopped = True
+                break
 
             # IDEA: do we even need the max-interaction based compaction?
             # IDEA: give the planner the option to trigger compaction itself by calling a tool
@@ -168,6 +290,8 @@ class Planner:
 
             tool_mapping = LLMFunctionMapping([
                 executor.perform_task,
+                self.ask_human,
+                self.knowledge.register_host_access,
                 self.knowledge.add_compromised_account,
                 self.knowledge.update_compromised_account,
                 self.knowledge.add_entity_information,
@@ -191,7 +315,11 @@ class Planner:
 
             # IDEA: unify planner and executor tool call handling
             if is_tool_call(response_message):
+                non_tool_response_counter = 0
                 await self.handle_tool_calls(response_message, executor, tool_mapping)
+                if self.human_stop_requested:
+                    human_stopped = True
+                    break
             else:
                 # TODO: check if we're really done and exit
 
@@ -199,15 +327,38 @@ class Planner:
                 # because the planner should only select a task to perform and call
                 # the respective tool for that. You might want to check if the LLM is able
                 # to call tools correctly.
+                non_tool_response_counter += 1
                 self.logger.console.print(Panel(Pretty(response_message.content), title="LLM Response Content"))
-                msg = {
-                    "role": "user",
-                    "content": "You MUST call the perform_task tool to delegate work to the executor. Select the most promising incomplete task from the plan and call perform_task with it now."
-                }
-                self.logger.log_append_to_history(msg, "manual", output=True)
-                self.history.append(msg)
+                if non_tool_response_counter >= 2:
+                    human_response = await self.ask_human(
+                        question=(
+                            "The planner has not produced an executable task for two rounds. "
+                            "Provide missing target/file information or tell it how to proceed. "
+                            "Reply 'stop' to end the run."
+                        ),
+                        reason="The planner is stalled and returned text instead of a tool call.",
+                    )
+                    msg = {
+                        "role": "user",
+                        "content": f"Human guidance: {human_response}",
+                    }
+                    self.logger.log_append_to_history(msg, "human", output=False)
+                    self.history.append(msg)
+                    non_tool_response_counter = 0
+                    if is_stop_response(human_response):
+                        human_stopped = True
+                        break
+                else:
+                    msg = {
+                        "role": "user",
+                        "content": "You MUST call the perform_task tool, or ask_human if you are blocked or missing a required file. Select the most promising incomplete task from the plan and call the appropriate tool now."
+                    }
+                    self.logger.log_append_to_history(msg, "manual", output=True)
+                    self.history.append(msg)
             
             interaction_counter += 1
         
-        if self.max_runtime != 0 and (datetime.datetime.now() - started).total_seconds() > self.max_runtime:
+        if human_stopped:
+            self.logger.log_data("completed", "Human operator stopped the planner.", output=True)
+        elif self.max_runtime != 0 and (datetime.datetime.now() - started).total_seconds() > self.max_runtime:
             self.logger.log_data("completed", f"Max runtime of {self.max_runtime} seconds exceeded, stopping planner loop.", output=True)

@@ -343,6 +343,7 @@ dependencies = [
     { name = "numpydoc" },
     { name = "python-dateutil" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "rich" },
     { name = "structlog" },
 ]
@@ -356,6 +357,7 @@ requires-dist = [
     { name = "numpydoc", specifier = ">=1.10.0" },
     { name = "python-dateutil", specifier = ">=2.9.0.post0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "rich", specifier = ">=14.3.3" },
     { name = "structlog", specifier = ">=25.5.0" },
 ]
