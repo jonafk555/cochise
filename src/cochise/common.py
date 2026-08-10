@@ -1,7 +1,9 @@
 import datetime
+import functools
+import inspect
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, get_type_hints
 
 import litellm
 
@@ -238,7 +240,7 @@ class LLMFunctionMapping:
         self.mapping = {}
 
         for i in tool_functions:
-            tool = litellm.utils.function_to_dict(i)
+            tool = _function_to_dict(i)
 
             self.tools.append({"type": "function", "function": tool})
             self.mapping[tool["name"]] = i
@@ -248,6 +250,34 @@ class LLMFunctionMapping:
 
     def get_function(self, value) -> Callable:
         return self.mapping[value]
+
+
+def _function_to_dict(function: Callable) -> dict[str, Any]:
+    """Build a LiteLLM tool definition for functions with deferred annotations.
+
+    LiteLLM currently assumes every annotation is a type and accesses its
+    ``__name__`` attribute.  Modules using ``from __future__ import
+    annotations`` instead expose annotation strings, which makes LiteLLM's
+    ``function_to_dict`` fail while constructing the tool list.
+    """
+    signature = inspect.signature(function)
+    if not any(isinstance(param.annotation, str) for param in signature.parameters.values()):
+        return litellm.utils.function_to_dict(function)
+
+    try:
+        resolved = get_type_hints(function)
+    except (NameError, TypeError):
+        # Preserve LiteLLM's existing behavior for functions whose forward
+        # references cannot be resolved in their defining module.
+        return litellm.utils.function_to_dict(function)
+
+    parameters = [
+        parameter.replace(annotation=resolved.get(name, parameter.annotation))
+        for name, parameter in signature.parameters.items()
+    ]
+    adapter = functools.wraps(function)(lambda *args, **kwargs: function(*args, **kwargs))
+    adapter.__signature__ = signature.replace(parameters=parameters)
+    return litellm.utils.function_to_dict(adapter)
 
 
 def _to_jsonable(value):
