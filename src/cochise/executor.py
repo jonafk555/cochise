@@ -38,11 +38,20 @@ async def perform_tool_call(id, tool_name, function, args):
     except Exception as e:
         result = f"Error executing tool {tool_name} with arguments {args}: {str(e)}"
 
+    metadata = {}
+    if isinstance(result, dict):
+        metadata = {
+            key: value
+            for key, value in result.items()
+            if key not in {"output", "stdout", "stderr"}
+        }
+
     return {
         'tool': tool_name,
         'cmd': args['command'] if 'command' in args else tool_name,
         'result': result['output'] if isinstance(result, dict) and 'output' in result else str(result),
         'exit_status': result['exit_status'] if isinstance(result, dict) and 'exit_status' in result else None,
+        'metadata': metadata,
         'tool_call_id': id
     }
 
@@ -149,7 +158,10 @@ class Executor:
             knowledge.add_compromised_account,
             knowledge.update_compromised_account,
             knowledge.add_entity_information,
-            knowledge.update_entity_information
+            knowledge.update_entity_information,
+            knowledge.record_host_privilege,
+            knowledge.register_shell_session,
+            knowledge.update_shell_session,
         ])
 
         prompt = f"[bold]Task: {next_step}\nCategorization:[/bold] {mitre_attack_tactic}/{mitre_attack_technique}\n\n[bold]Context:[/bold]\n{next_step_context}\n\n[bold]Existing Knowledge:[/bold]\n{self.system_knowledge.get_knowledge()}"

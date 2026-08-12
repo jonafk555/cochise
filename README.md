@@ -94,9 +94,12 @@ PLANNER_MAX_INTERACTIONS=0         # max planner rounds (0 = unlimited) before h
 
 # Cyber Range assessment
 RANGE_MODE='blackbox'              # blackbox or whitebox
-RANGE_SPEC_PATH=''                 # YAML/JSON spec for whitebox mode
+RANGE_SPEC_PATH=''                 # YAML/JSON/Markdown/text spec for whitebox mode
 RANGE_NETWORKS='192.168.122.0/24' # optional comma-separated scan targets
 RANGE_CONTROL_PLANE_MODULE=''      # optional local module:factory adapter
+RANGE_VICTIM_MODULE=''              # optional victim-side module:factory adapter
+QA_REPORT_PATH='logs/qa-report.md' # continuously updated Markdown QA report
+QA_ARTIFACT_DIR=''                  # optional single directory for deduplicated artifact index
 LLM_HEALTHCHECK=1                  # verify tool calling before preflight
 HUMAN_INTERACTION=1                # set to 0 to disable prompts; continue autonomously
 ```
@@ -143,9 +146,10 @@ tool/function calling because Cochise delegates SSH and knowledge-base actions
 through tools.
 
 Cyber Range assessment is mandatory. Black-box mode collects evidence from the
-attacker VM; white-box mode additionally compares observations with the
-platform-neutral YAML/JSON document described by
-`src/cochise/templates/range_spec.schema.json`. A global preflight runs before
+attacker VM; white-box mode additionally compares observations with a
+user-supplied YAML, JSON, Markdown, or natural-language document. Structured
+fields are optional hints; the LLM semantically interprets the raw document
+and versions the expectation manifest. A global preflight runs before
 the Planner creates an attack plan. Every newly accessed host must then pass a
 read-only inventory and attack-feasibility assessment before ordinary attack
 work continues. Blocking findings pause the run and request human guidance;
@@ -153,6 +157,14 @@ with `HUMAN_INTERACTION=0`, the run continues autonomously and records the
 override. The system does not automatically repair the range. A management-plane
 adapter can be supplied with `RANGE_CONTROL_PLANE_MODULE=module:factory`; it must
 implement `collect_global(spec)` and `collect_host(host_id, host, spec)`.
+An optional victim-side adapter can be supplied with
+`RANGE_VICTIM_MODULE=module:factory`; it implements
+`execute_victim_command(host_id, command, purpose, shell_id)` and keeps victim
+evidence separate from attacker evidence. The assessment worker records the
+shell ID, effective identity, and privilege changes so subsequent attack
+validation uses the correct reverse shell. Every host uses the common baseline
+and then the applicable Windows endpoint, Windows AD, or Linux checks; domain
+membership is determined from evidence rather than assumed.
 
 ### Run
 
@@ -164,7 +176,7 @@ for the LLM ('attack the AD network'). It also contains the target IP range (har
 uv run cochise
 ```
 
-Cochise will create a timestamped JSON log in `logs/` capturing every LLM call, command execution, and discovered credential.
+Cochise will create a timestamped JSON log in `logs/` capturing every LLM call, command execution, and discovered credential. The Cyber Range QA report is continuously updated at `QA_REPORT_PATH` (default: `logs/qa-report.md`) after the global preflight and every host assessment. Large adapter/tool evidence is deduplicated into one `artifact-manifest.jsonl` under `QA_ARTIFACT_DIR` or alongside the report in `artifacts/`; raw trajectory logs remain unchanged.
 
 ### Human-in-the-loop
 

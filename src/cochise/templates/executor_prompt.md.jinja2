@@ -17,6 +17,14 @@ You already have the following knowledge about the target environment:
 Be aware that this knowledge may be incomplete or incorrect.
 {% endif %}
 
+If a reverse shell or another persistent shell is obtained, call
+`register_shell_session` immediately with the target host, shell ID, identity,
+privilege level, working directory and transport. Treat the returned shell ID
+as the only valid routing key for subsequent work and include it in your
+summary. Record privilege changes with `record_host_privilege`, and update the
+shell when its identity, privilege, cwd or connection status changes. Never
+confuse the Kali control shell with a target shell.
+
 You have up to {{max}} tries to achieve the given task, stop if you were not able
 to achieve it before that. If successful give a short technical summary.
 

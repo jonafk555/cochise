@@ -12,6 +12,7 @@ from cochise.assessment import (
     CompositeRangeAdapter,
     RangeAssessmentCoordinator,
     load_control_plane_adapter,
+    load_victim_adapter,
     load_range_spec,
 )
 from cochise.common import check_llm_tool_calling, get_llm_config_from_env
@@ -19,6 +20,7 @@ from cochise.executor import ExecutorFactory
 from cochise.human_interaction import HumanInteraction
 from cochise.planner import Planner
 from cochise.logger import Logger
+from cochise.qa_report import QAReportWriter
 from cochise.ssh_connection import get_ssh_connection_from_env
 
 SCENARIO = (pathlib.Path(__file__).parent.parent / "templates" / "scenario.md").read_text()
@@ -38,7 +40,8 @@ def _configured_networks() -> list[str]:
 async def async_main() -> None:
 
     # setup configuration from environment variables
-    load_dotenv()
+    # Treat the project .env as the authoritative runtime configuration.
+    load_dotenv(override=True)
     # Resolve the selected provider once and share the same connection details
     # with the planner and every short-lived executor.
     llm_config = get_llm_config_from_env()
@@ -102,6 +105,21 @@ async def async_main() -> None:
         raise ValueError("RANGE_MODE=whitebox requires RANGE_SPEC_PATH")
 
     control_plane = load_control_plane_adapter(os.getenv("RANGE_CONTROL_PLANE_MODULE"))
+    victim_adapter = load_victim_adapter(os.getenv("RANGE_VICTIM_MODULE"))
+    qa_report_path = os.getenv("QA_REPORT_PATH", "logs/qa-report.md").strip()
+    qa_artifact_dir = os.getenv("QA_ARTIFACT_DIR", "").strip() or None
+    qa_report = QAReportWriter(
+        qa_report_path or "logs/qa-report.md",
+        artifact_dir=qa_artifact_dir,
+        metadata={
+            "range_mode": range_mode,
+            "range_spec": range_spec_path or "none",
+            "control_plane": bool(control_plane),
+            "victim_validation": bool(victim_adapter),
+            "artifact_dir": qa_artifact_dir or "<report-dir>/artifacts",
+        },
+    )
+    logger.log_data("qa_report", str(qa_report.path), output=False)
     range_adapter = CompositeRangeAdapter(
         BlackBoxRangeAdapter(conn.execute_command, _configured_networks()),
         control_plane,
@@ -113,12 +131,15 @@ async def async_main() -> None:
         tools,
         logger,
         human_interaction,
+        victim_adapter=victim_adapter,
+        report_writer=qa_report,
     )
     assessment_coordinator = RangeAssessmentCoordinator(
         range_adapter,
         logger,
         range_spec if range_mode == "whitebox" else None,
         assessment_executor.assess_host,
+        report_writer=qa_report,
     )
     executor_factory = ExecutorFactory(
         llm_config,
@@ -142,6 +163,12 @@ async def async_main() -> None:
     )
 
     # ..and run cochise!
-    await planner.engage()
+    try:
+        await planner.engage()
+    except Exception as exc:
+        qa_report.finalize("failed", str(exc))
+        raise
+    else:
+        qa_report.finalize("completed")
 
 asyncio.run(async_main())

@@ -11,8 +11,10 @@ from cochise.assessment import (
     CompositeRangeAdapter,
     RangeAssessmentCoordinator,
     load_range_spec,
+    VictimCommandRouter,
 )
 from cochise.knowledge import Knowledge
+from cochise.qa_report import QAReportWriter
 
 
 class FakeConsole:
@@ -61,6 +63,81 @@ class AssessmentTests(unittest.TestCase):
         self.assertEqual(spec.host("dc01")["ips"], ["10.0.0.10"])
         self.assertEqual(spec.validate()[0].status, "pass")
 
+    def test_unstructured_markdown_spec_is_preserved_for_semantic_qa(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "range.md"
+            path.write_text(
+                "# Mixed range\n\nThe Linux web host is standalone; client01 is a Windows endpoint.\n",
+                encoding="utf-8",
+            )
+            spec = load_range_spec(path)
+
+        self.assertEqual(spec.format, "markdown")
+        self.assertIn("Linux web host", spec.raw_content)
+        self.assertIn("semantic", spec.semantic_context().lower())
+        self.assertEqual(spec.validate()[0].status, "pass")
+
+    def test_permissive_specs_keep_malformed_text_and_mapping_hosts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            json_path = Path(directory) / "range.json"
+            json_path.write_text('{ "hosts": { "dc01": { "role": "domain controller" } }', encoding="utf-8")
+            malformed = load_range_spec(json_path)
+            self.assertEqual(malformed.format, "json-text")
+            self.assertIn('"hosts"', malformed.raw_content)
+
+            yaml_path = Path(directory) / "range.yaml"
+            yaml_path.write_text(
+                "hosts:\n  dc01:\n    role: domain controller\n",
+                encoding="utf-8",
+            )
+            mapped = load_range_spec(yaml_path)
+            self.assertEqual(mapped.host("dc01")["role"], "domain controller")
+
+    def test_knowledge_records_expectations_privilege_and_shell(self):
+        async def scenario():
+            knowledge = Knowledge(FakeLogger())
+            await knowledge.set_expectation_manifest("v1")
+            await knowledge.add_assessment_expectation(
+                "exp-1",
+                "client01",
+                "Windows endpoint should be reachable",
+                importance="high",
+                manifest_version="v1",
+            )
+            await knowledge.update_assessment_expectation(
+                "exp-1", "pass", confidence=0.9, observed="SMB reachable"
+            )
+            await knowledge.register_shell_session(
+                "sh-1",
+                "linux-web",
+                platform="linux",
+                identity="www-data",
+                privilege_level="user",
+                cwd="/var/www",
+            )
+            self.assertIn("sh-1", knowledge.get_shell_sessions_context())
+            self.assertEqual(knowledge.assessment_expectations["exp-1"]["status"], "pass")
+            self.assertEqual(knowledge.get_host("linux-web")["privilege_level"], "user")
+            self.assertTrue(knowledge.privilege_events)
+            self.assertIn("Privilege events", knowledge.get_compact_knowledge())
+
+        asyncio.run(scenario())
+
+    def test_victim_router_marks_source_and_host(self):
+        class Adapter:
+            async def execute_victim_command(self, host_id, command, purpose="", shell_id=""):
+                return {"output": "event observed", "exit_status": 0}
+
+        async def scenario():
+            result = await VictimCommandRouter(Adapter()).execute_victim_command(
+                "win01", "Get-WinEvent", "victim baseline"
+            )
+            self.assertEqual(result["source"], "victim")
+            self.assertEqual(result["host_id"], "win01")
+            self.assertEqual(result["exit_status"], 0)
+
+        asyncio.run(scenario())
+
     def test_global_blackbox_preflight_records_evidence(self):
         async def runner(command, technique, procedure):
             return {"output": f"evidence for {command}", "exit_status": 0}
@@ -69,14 +146,24 @@ class AssessmentTests(unittest.TestCase):
             logger = FakeLogger()
             knowledge = Knowledge(logger)
             adapter = BlackBoxRangeAdapter(runner, ["10.0.0.0/24"])
-            coordinator = RangeAssessmentCoordinator(adapter, logger)
+            with tempfile.TemporaryDirectory() as directory:
+                report_writer = QAReportWriter(Path(directory) / "qa-report.md")
+                coordinator = RangeAssessmentCoordinator(
+                    adapter,
+                    logger,
+                    report_writer=report_writer,
+                )
 
-            result = await coordinator.run_global_preflight(knowledge)
+                result = await coordinator.run_global_preflight(knowledge)
 
-            self.assertEqual(result.scope, "global")
-            self.assertEqual(result.status, "pass")
-            self.assertGreaterEqual(len(knowledge.assessment_findings), 4)
-            self.assertEqual(knowledge.get_pending_hosts(), [])
+                self.assertEqual(result.scope, "global")
+                self.assertEqual(result.status, "pass")
+                self.assertGreaterEqual(len(knowledge.assessment_findings), 4)
+                self.assertEqual(knowledge.get_pending_hosts(), [])
+                self.assertIn(
+                    "Global: `cyber-range`",
+                    report_writer.path.read_text(encoding="utf-8"),
+                )
 
         asyncio.run(scenario())
 

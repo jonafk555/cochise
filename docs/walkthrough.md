@@ -28,7 +28,7 @@ The `async_main()` function is the single entry point. It performs setup in a st
 3. **Create SSH connection** (`get_ssh_connection_from_env()`) and connect to the target.
 4. **Initialize logger** with a `Rich` console for pretty output and `structlog` for JSON log files under `logs/`. `HUMAN_INTERACTION=0` disables stdin prompts and automatically continues; blocking assessment overrides are recorded in the log.
 5. **Build components:** An `ExecutorFactory` is created with the model, API key, scenario text, the SSH `execute_command` tool, and the logger. A `RangeAssessmentCoordinator` is created with the black-box adapter and optional white-box spec. A `Planner` is created with the factory, assessment coordinator, and configuration limits.
-6. **Start the run** by calling `planner.engage()`. The Planner runs the mandatory global Cyber Range preflight before creating its initial attack plan.
+6. **Start the run** by calling `planner.engage()`. The Planner runs the mandatory global Cyber Range preflight before creating its initial attack plan. `QA_REPORT_PATH` points to a continuously updated Markdown report; it is refreshed after global and host assessments.
 
 The scenario text is loaded at import time from `templates/scenario.md` and describes the penetration test objective (Active Directory domain dominance on 192.168.122.0/24).
 
@@ -95,13 +95,17 @@ The assessment coordinator provides two mandatory gates:
 
 1. A global black-box preflight runs from the attacker VM before the initial
    Planner plan. It records interface, route, DNS, and configured network
-   reachability evidence. A white-box YAML/JSON spec can add expected topology
-   and host facts.
+   reachability evidence. A white-box YAML, JSON, Markdown, or natural-language
+   spec can add expected topology and host facts; the LLM interprets the raw
+   document and creates a versioned semantic expectation manifest rather than
+   requiring fixed fields.
 2. The Executor calls `register_host_access` after confirming a newly accessed
-   host. Before the Planner selects another ordinary task, an assessment worker
-   performs read-only inventory and then attack-feasibility validation for that
-   host. Findings cover OS/kernel, software, services, processes, DLLs,
-   firewall/ACL behavior, AD state, and endpoint protection where observable.
+   host. Before the Planner selects another ordinary task, a short-lived LLM
+   QA supervisor/host worker performs read-only inventory and then
+   attack-feasibility validation for that host. It runs the common baseline and
+   only the applicable Windows endpoint (workstation/server, joined or
+   standalone), Windows AD, and Linux (AD-integrated or standalone) checks.
+   Optional victim-side commands are correlated with attacker-side evidence.
 
 With human interaction enabled, blocking findings pause for human guidance. With
 `HUMAN_INTERACTION=0`, the coordinator records the finding and the Planner

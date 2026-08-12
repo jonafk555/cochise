@@ -16,6 +16,7 @@ import json
 import pathlib
 import re
 import shlex
+import textwrap
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol
 
@@ -32,6 +33,7 @@ from cochise.common import (
 from cochise.executor import perform_tool_call
 from cochise.human_interaction import HumanInteraction, is_stop_response
 from cochise.knowledge import Knowledge
+from cochise.qa_report import QAReportWriter
 
 
 TEMPLATE_DIR = pathlib.Path(__file__).parent / "templates"
@@ -69,7 +71,13 @@ def _stable_id(*parts: str) -> str:
 
 def _normalise_status(value: Any) -> str:
     value = str(value or "unknown").strip().lower().replace(" ", "_")
-    return value if value in {"pass", "fail", "unknown", "not_applicable"} else "unknown"
+    return value if value in {
+        "pass",
+        "fail",
+        "unknown",
+        "not_applicable",
+        "blocked_by_access",
+    } else "unknown"
 
 
 def _normalise_severity(value: Any) -> str:
@@ -95,6 +103,7 @@ class AssessmentFinding:
     assessment_id: str = ""
     timestamp: str = field(default_factory=_now)
     dirty: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.status = _normalise_status(self.status)
@@ -135,6 +144,7 @@ class AssessmentFinding:
             "assessment_id": self.assessment_id,
             "timestamp": self.timestamp,
             "dirty": self.dirty,
+            "metadata": self.metadata,
         }
 
     @classmethod
@@ -161,6 +171,7 @@ class AssessmentFinding:
             assessment_id=str(value.get("assessment_id") or ""),
             timestamp=str(value.get("timestamp") or _now()),
             dirty=bool(value.get("dirty", True)),
+            metadata=dict(value.get("metadata") or {}),
         )
 
 
@@ -176,6 +187,7 @@ class AssessmentResult:
     evidence: list[dict[str, Any]] = field(default_factory=list)
     started_at: str = field(default_factory=_now)
     completed_at: str = field(default_factory=_now)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def blocking_findings(self) -> list[AssessmentFinding]:
@@ -203,6 +215,7 @@ class AssessmentResult:
             ],
             "started_at": self.started_at,
             "completed_at": self.completed_at,
+            "metadata": self.metadata,
         }
 
 
@@ -210,17 +223,66 @@ class AssessmentResult:
 class RangeSpec:
     """A platform-neutral wrapper around a white-box Cyber Range document."""
 
-    data: dict[str, Any]
+    # ``data`` remains available for existing adapters which understand the
+    # small structured subset of the original schema.  ``raw_text`` is the
+    # canonical input for the LLM and allows a spec to be Markdown, plain text,
+    # or a partially structured document without forcing a rigid schema.
+    data: dict[str, Any] = field(default_factory=dict)
     source: str | None = None
+    raw_text: str = ""
+    format: str = "mapping"
+    content_hash: str = ""
 
     @property
     def mode(self) -> str:
         return "whitebox"
 
     @property
+    def raw_content(self) -> str:
+        if self.raw_text:
+            return self.raw_text
+        if not self.data:
+            return ""
+        return json.dumps(self.data, ensure_ascii=False, indent=2)
+
+    def semantic_context(self, max_chars: int = 120_000) -> str:
+        """Return a bounded, labelled spec context for the semantic QA agent.
+
+        The full source remains available through ``raw_content`` and is kept
+        in the run log.  Bounding the prompt protects long natural-language
+        specs from consuming the host worker's entire context window.
+        """
+
+        content = self.raw_content
+        if len(content) > max_chars:
+            content = content[:max_chars] + "\n...[spec truncated for context]"
+        label = self.source or "inline"
+        return textwrap.dedent(
+            f"""
+            White-box environment specification for semantic interpretation (source: {label}, format: {self.format},
+            sha256: {self.content_hash or 'unknown'}):
+
+            ```text
+            {content}
+            ```
+            """
+        ).strip()
+
+    @property
     def hosts(self) -> list[dict[str, Any]]:
         hosts = self.data.get("hosts", [])
-        return hosts if isinstance(hosts, list) else []
+        if isinstance(hosts, dict):
+            return [
+                {**value, "id": str(host_id)}
+                if isinstance(value, dict)
+                else {"id": str(host_id), "description": str(value)}
+                for host_id, value in hosts.items()
+            ]
+        return (
+            [host for host in hosts if isinstance(host, dict)]
+            if isinstance(hosts, list)
+            else []
+        )
 
     def host(self, host_id: str) -> dict[str, Any]:
         for host in self.hosts:
@@ -259,7 +321,7 @@ class RangeSpec:
 
     def validate(self) -> list[AssessmentFinding]:
         findings: list[AssessmentFinding] = []
-        if not self.data:
+        if not self.raw_content.strip() and not self.data:
             findings.append(AssessmentFinding(
                 finding_id="range-spec-empty",
                 scope="global",
@@ -272,46 +334,77 @@ class RangeSpec:
                 source="whitebox",
             ))
             return findings
-        if not self.hosts and not self.data.get("segments") and not self.data.get("networks"):
-            findings.append(AssessmentFinding(
-                finding_id="range-spec-no-topology",
-                scope="global",
-                category="infra",
-                title="White-box range spec has no topology",
-                description="The spec must provide hosts, segments, or networks.",
-                status="fail",
-                severity="blocking",
-                confidence=1.0,
-                source="whitebox",
-            ))
-        else:
-            findings.append(AssessmentFinding(
-                finding_id="range-spec-loaded",
-                scope="global",
-                category="infra",
-                title="White-box range spec loaded",
-                description="A Cyber Range specification was loaded for comparison.",
-                status="pass",
-                severity="info",
-                confidence=1.0,
-                observed_value=self.source or "inline",
-                source="whitebox",
-            ))
+        findings.append(AssessmentFinding(
+            finding_id="range-spec-loaded",
+            scope="global",
+            category="infra",
+            title="White-box range spec loaded",
+            description=(
+                "A Cyber Range specification was loaded for LLM semantic interpretation. "
+                "Unstructured or incomplete topology is allowed."
+            ),
+            status="pass",
+            severity="info",
+            confidence=1.0,
+            observed_value=self.source or "inline",
+            source="whitebox",
+            metadata={"format": self.format, "content_hash": self.content_hash},
+        ))
         return findings
 
 
 def load_range_spec(path: str | pathlib.Path) -> RangeSpec:
-    """Load a JSON or YAML white-box spec without executing arbitrary content."""
+    """Load a permissive white-box spec without executing arbitrary content.
+
+    YAML/JSON mappings are parsed opportunistically for existing range adapters.
+    Markdown and plain text remain raw semantic input.  A malformed structured
+    document is also retained as text so the LLM can explain the ambiguity
+    instead of the loader silently inventing a topology.
+    """
 
     spec_path = pathlib.Path(path)
-    raw_text = spec_path.read_text()
-    if spec_path.suffix.lower() == ".json":
-        data = json.loads(raw_text)
+    raw_text = spec_path.read_text(encoding="utf-8")
+    suffix = spec_path.suffix.lower()
+    format_name = "markdown" if suffix in {".md", ".markdown"} else "text"
+    data: dict[str, Any] = {}
+    if suffix == ".json":
+        format_name = "json"
+        try:
+            parsed = json.loads(raw_text)
+            if isinstance(parsed, dict):
+                data = parsed
+            else:
+                format_name = "json-text"
+        except json.JSONDecodeError:
+            format_name = "json-text"
+    elif suffix in {".yaml", ".yml"}:
+        format_name = "yaml"
+        try:
+            parsed = yaml.safe_load(raw_text)
+            if isinstance(parsed, dict):
+                data = parsed
+            else:
+                format_name = "yaml-text"
+        except yaml.YAMLError:
+            format_name = "yaml-text"
     else:
-        data = yaml.safe_load(raw_text)
-    if not isinstance(data, dict):
-        raise ValueError(f"Range spec {spec_path} must contain a mapping at the top level")
-    return RangeSpec(data=data, source=str(spec_path))
+        # A best-effort parse preserves convenient existing ``hosts`` and
+        # ``networks`` hints while keeping arbitrary text as the source of
+        # truth for the LLM.
+        try:
+            parsed = yaml.safe_load(raw_text)
+            if isinstance(parsed, dict):
+                data = parsed
+                format_name = "yaml"
+        except yaml.YAMLError:
+            pass
+    return RangeSpec(
+        data=data,
+        source=str(spec_path),
+        raw_text=raw_text,
+        format=format_name,
+        content_hash=hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+    )
 
 
 class RangeAdapter(Protocol):
@@ -340,6 +433,111 @@ class ControlPlaneAdapter(Protocol):
         spec: RangeSpec | None = None,
     ) -> dict[str, Any]:
         ...
+
+
+class VictimAdapter(Protocol):
+    """Optional victim-side command/session adapter.
+
+    The adapter is deliberately small.  It may use WinRM, SSH, a range
+    control-plane, or a reverse-shell implementation supplied by the caller.
+    Cochise only routes the LLM's bounded command request and records the
+    provenance; it never executes commands from the spec directly.
+    """
+
+    async def execute_victim_command(
+        self,
+        host_id: str,
+        command: str,
+        purpose: str = "",
+        shell_id: str = "",
+    ) -> Any:
+        ...
+
+
+class VictimCommandRouter:
+    """Expose an optional victim adapter through LLM tool-calling.
+
+    A router keeps attacker and victim execution visibly separate in tool
+    results.  Adapters may return the legacy string or a mapping containing
+    output/exit_status and optional shell metadata.
+    """
+
+    def __init__(self, adapter: VictimAdapter):
+        self.adapter = adapter
+
+    async def execute_victim_command(
+        self,
+        host_id: str,
+        command: str,
+        purpose: str = "",
+        shell_id: str = "",
+    ) -> Any:
+        result = await self.adapter.execute_victim_command(
+            host_id,
+            command,
+            purpose,
+            shell_id,
+        )
+        if isinstance(result, dict):
+            result = dict(result)
+            result["source"] = "victim"
+            result["host_id"] = host_id
+            if shell_id:
+                result["shell_id"] = shell_id
+            return result
+        return {
+            "output": str(result),
+            "exit_status": 0,
+            "source": "victim",
+            "host_id": host_id,
+            "shell_id": shell_id or None,
+        }
+
+    async def execute_shell_command(
+        self,
+        shell_id: str,
+        command: str,
+        purpose: str = "",
+    ) -> Any:
+        method = getattr(self.adapter, "execute_shell_command", None)
+        if method is None:
+            return {
+                "output": (
+                    f"Victim adapter does not support persistent shell '{shell_id}'. "
+                    "Use execute_victim_command or configure an adapter with shell support."
+                ),
+                "exit_status": 1,
+                "source": "victim",
+                "shell_id": shell_id,
+                "error_type": "shell_not_supported",
+            }
+        result = await method(shell_id, command, purpose)
+        if isinstance(result, dict):
+            result = dict(result)
+            result["source"] = "victim"
+            result["shell_id"] = shell_id
+            return result
+        return {
+            "output": str(result),
+            "exit_status": 0,
+            "source": "victim",
+            "shell_id": shell_id,
+        }
+
+
+def load_victim_adapter(reference: str | None) -> VictimCommandRouter | None:
+    """Load an optional victim adapter using the existing ``module:factory`` hook."""
+
+    if not reference:
+        return None
+    module_name, separator, attribute = reference.partition(":")
+    if not separator or not module_name or not attribute:
+        raise ValueError("RANGE_VICTIM_MODULE must use module:factory syntax")
+    factory = getattr(importlib.import_module(module_name), attribute)
+    adapter = factory()
+    if not hasattr(adapter, "execute_victim_command"):
+        raise TypeError("Victim adapter must implement execute_victim_command")
+    return VictimCommandRouter(adapter)
 
 
 class CompositeRangeAdapter:
@@ -438,6 +636,7 @@ class BlackBoxRangeAdapter:
             return {
                 "command": command,
                 "category": category,
+                "source": "attacker",
                 "output": redact_sensitive(output),
                 "exit_status": exit_status,
                 "stderr": redact_sensitive(stderr) if stderr else None,
@@ -446,6 +645,7 @@ class BlackBoxRangeAdapter:
             return {
                 "command": command,
                 "category": category,
+                "source": "attacker",
                 "output": "",
                 "exit_status": None,
                 "error": redact_sensitive(exc),
@@ -595,17 +795,30 @@ class RangeAssessmentCoordinator:
         logger,
         spec: RangeSpec | None = None,
         host_assessor: HostAssessor | None = None,
+        report_writer: QAReportWriter | None = None,
     ) -> None:
         self.adapter = adapter
         self.logger = logger
         self.spec = spec
         self.host_assessor = host_assessor
+        self.report_writer = report_writer
         self.global_result: AssessmentResult | None = None
 
     async def run_global_preflight(self, knowledge: Knowledge) -> AssessmentResult:
         spec_source = self.spec.source if self.spec else "blackbox"
         assessment_id = f"global-{_stable_id(_now(), spec_source)}"
         started_at = _now()
+        if self.report_writer:
+            self.report_writer.record_progress(
+                assessment_id,
+                scope="global",
+                mode="whitebox" if self.spec else "blackbox",
+                target="cyber-range",
+                status="running",
+                phase="global-discovery",
+                round_number=0,
+                metadata={"worker_type": "global_discovery"},
+            )
         findings = self.spec.validate() if self.spec else []
         mode = "whitebox" if self.spec else "blackbox"
         try:
@@ -653,10 +866,25 @@ class RangeAssessmentCoordinator:
             evidence=evidence,
             started_at=started_at,
             completed_at=_now(),
+            metadata={
+                "spec_source": self.spec.source if self.spec else "",
+                "spec_format": self.spec.format if self.spec else "blackbox",
+                "spec_hash": self.spec.content_hash if self.spec else "",
+                "worker_type": "global_discovery",
+            },
         )
         knowledge.record_assessment_result(result)
+        if self.spec:
+            for host in self.spec.hosts:
+                host_id = str(
+                    host.get("id") or host.get("host_id") or host.get("node_ref") or ""
+                ).strip()
+                if host_id:
+                    knowledge.register_spec_host(host_id, host)
         self.global_result = result
         self.logger.log_data("assessment_global", result.to_dict(), output=False)
+        if self.report_writer:
+            self.report_writer.record_result(result)
         return result
 
     async def assess_host(self, host_id: str, knowledge: Knowledge) -> AssessmentResult | None:
@@ -667,6 +895,17 @@ class RangeAssessmentCoordinator:
         mode = "whitebox" if self.spec else "blackbox"
         assessment_id = f"host-{_stable_id(host_id, _now())}"
         started_at = _now()
+        if self.report_writer:
+            self.report_writer.record_progress(
+                assessment_id,
+                scope="host",
+                mode="whitebox" if self.spec else "blackbox",
+                target=host_id,
+                status="running",
+                phase="host-collection",
+                round_number=0,
+                metadata={"worker_type": "host_qa", "host_id": host_id},
+            )
         expected = self.spec.host(host_id) if self.spec else {}
         adapter_findings: list[AssessmentFinding] = []
         try:
@@ -692,10 +931,21 @@ class RangeAssessmentCoordinator:
             ))
         context = json.dumps(
             {
+                "assessment_id": assessment_id,
                 "host": host,
                 "whitebox_expected": expected,
+                # Keep repeated per-host prompts bounded; the full source hash
+                # and raw document remain in the run log for replay.
+                "whitebox_spec": (
+                    self.spec.semantic_context(max_chars=40_000)
+                    if self.spec
+                    else ""
+                ),
+                "spec_format": self.spec.format if self.spec else "blackbox",
+                "spec_hash": self.spec.content_hash if self.spec else "",
                 "adapter_evidence": evidence,
-                "current_knowledge": knowledge.get_knowledge(),
+                "current_knowledge": knowledge.get_compact_knowledge(),
+                "active_shell_sessions": knowledge.get_shell_sessions_context(),
             },
             ensure_ascii=False,
             indent=2,
@@ -708,6 +958,20 @@ class RangeAssessmentCoordinator:
                 result.findings = adapter_findings + result.findings
                 result.evidence = evidence + result.evidence
                 result.status = _assessment_status(result.findings, result.status)
+                # The coordinator owns the gate identity.  A host worker may
+                # create its own local ID, but exposing two IDs for one host
+                # would duplicate real-time report rows and assessment state.
+                result.assessment_id = assessment_id
+                for finding in result.findings:
+                    finding.assessment_id = assessment_id
+                result.metadata = {
+                    **result.metadata,
+                    "worker_type": result.metadata.get("worker_type", "host_qa"),
+                    "host_id": host_id,
+                    "spec_source": self.spec.source if self.spec else "",
+                    "spec_format": self.spec.format if self.spec else "blackbox",
+                    "spec_hash": self.spec.content_hash if self.spec else "",
+                }
             except Exception as exc:
                 adapter_findings.append(_adapter_failure_finding(
                     assessment_id=assessment_id,
@@ -727,6 +991,7 @@ class RangeAssessmentCoordinator:
                     evidence=evidence,
                     started_at=started_at,
                     completed_at=_now(),
+                    metadata={"worker_type": "host_qa", "host_id": host_id},
                 )
         else:
             findings = adapter_findings
@@ -758,10 +1023,13 @@ class RangeAssessmentCoordinator:
                 evidence=evidence,
                 started_at=started_at,
                 completed_at=_now(),
+                metadata={"worker_type": "host_qa", "host_id": host_id},
             )
 
         knowledge.record_assessment_result(result)
         self.logger.log_data(f"assessment_host_{host_id}", result.to_dict(), output=False)
+        if self.report_writer:
+            self.report_writer.record_result(result)
         return result
 
 
@@ -778,6 +1046,8 @@ class AssessmentExecutor:
         configured_tools: list[Callable],
         logger,
         human_interaction: HumanInteraction | None = None,
+        victim_adapter: VictimCommandRouter | None = None,
+        report_writer: QAReportWriter | None = None,
     ) -> None:
         self.model = model
         self.api_key = api_key
@@ -785,14 +1055,40 @@ class AssessmentExecutor:
         self.configured_tools = configured_tools
         self.logger = logger
         self.human_interaction = human_interaction or HumanInteraction(logger.console)
+        self.victim_adapter = victim_adapter
+        self.report_writer = report_writer
 
     async def ask_human(self, question: str, reason: str) -> str:
         return await self.human_interaction.ask_human(question, reason)
 
     async def assess_host(self, host_id: str, context: str, mode: str) -> AssessmentResult:
         assessment_id = f"host-{_stable_id(host_id, _now())}"
+        try:
+            parsed_context = json.loads(context)
+            context_id = (
+                parsed_context.get("assessment_id")
+                if isinstance(parsed_context, dict)
+                else None
+            )
+            if context_id:
+                assessment_id = str(context_id)
+        except (TypeError, json.JSONDecodeError):
+            # Custom host assessors may pass a non-JSON context; retain the
+            # existing local ID fallback for compatibility.
+            pass
         started_at = _now()
         local_knowledge = Knowledge(self.logger)
+        if self.report_writer:
+            self.report_writer.record_progress(
+                assessment_id,
+                scope="host",
+                mode=mode,
+                target=host_id,
+                status="running",
+                phase="host-qa-start",
+                round_number=0,
+                metadata={"worker_type": "host_qa", "host_id": host_id},
+            )
         prompt = Template(ASSESSMENT_PROMPT).render({
             "host_id": host_id,
             "context": context,
@@ -807,9 +1103,34 @@ class AssessmentExecutor:
             self.ask_human,
             local_knowledge.add_assessment_finding,
             local_knowledge.add_entity_information,
+            local_knowledge.add_assessment_expectation,
+            local_knowledge.update_assessment_expectation,
+            local_knowledge.set_expectation_manifest,
+            local_knowledge.record_host_privilege,
+            local_knowledge.register_shell_session,
+            local_knowledge.update_shell_session,
         ])
+        if self.victim_adapter:
+            tools = LLMFunctionMapping(
+                self.configured_tools
+                + [
+                    self.victim_adapter.execute_victim_command,
+                    self.victim_adapter.execute_shell_command,
+                    self.ask_human,
+                    local_knowledge.add_assessment_finding,
+                    local_knowledge.add_entity_information,
+                    local_knowledge.add_assessment_expectation,
+                    local_knowledge.update_assessment_expectation,
+                    local_knowledge.set_expectation_manifest,
+                    local_knowledge.record_host_privilege,
+                    local_knowledge.register_shell_session,
+                    local_knowledge.update_shell_session,
+                ]
+            )
         summary: str | None = None
         stopped = False
+        tool_result_count = 0
+        tool_evidence: list[dict[str, Any]] = []
 
         for _round in range(1, self.MAX_ROUNDS + 1):
             response_message, costs, duration = llm_tool_call(
@@ -843,18 +1164,81 @@ class AssessmentExecutor:
                 ))
             for task in asyncio.as_completed(tasks):
                 result = await task
+                tool_result_count += 1
                 self.logger.log_tool_result(
                     result["tool"],
                     result["tool_call_id"],
                     result["result"],
                     output=False,
                 )
+                metadata = result.get("metadata", {}) or {}
+                if result["tool"] in {
+                    "execute_command",
+                    "execute_victim_command",
+                    "execute_shell_command",
+                }:
+                    tool_evidence.append({
+                        "source": metadata.get(
+                            "source",
+                            "victim" if result["tool"] != "execute_command" else "attacker",
+                        ),
+                        "category": "victim-command"
+                        if metadata.get("source") == "victim"
+                        else "attacker-command",
+                        "tool": result["tool"],
+                        "command": result.get("cmd", result["tool"]),
+                        "output": redact_sensitive(result["result"]),
+                        "exit_status": result.get("exit_status"),
+                        "host_id": metadata.get("host_id", host_id),
+                        "shell_id": metadata.get("shell_id", ""),
+                    })
+                tool_content = result["result"]
+                # Victim adapters can return a shell identifier or provenance
+                # that is not present in their textual output.  Keep the
+                # attacker/victim boundary and the continuation shell visible
+                # to the next LLM turn without copying raw evidence into the
+                # prompt more than once.
+                if metadata.get("source") == "victim":
+                    tool_content = json.dumps(
+                        {
+                            "output": result["result"],
+                            "execution_context": metadata,
+                        },
+                        ensure_ascii=False,
+                    )
                 history.append({
                     "tool_call_id": result["tool_call_id"],
                     "role": "tool",
                     "name": result["tool"],
-                    "content": result["result"],
+                    "content": tool_content,
                 })
+                if self.report_writer:
+                    self.report_writer.record_progress(
+                        assessment_id,
+                        scope="host",
+                        mode=mode,
+                        target=host_id,
+                        status="running",
+                        phase=(
+                            "victim-validation"
+                            if metadata.get("source") == "victim"
+                            else "attacker-validation"
+                        ),
+                        round_number=_round,
+                        summary="Tool result received; semantic QA is continuing.",
+                        findings=list(local_knowledge.assessment_findings.values()),
+                        evidence_count=tool_result_count,
+                        metadata={
+                            "worker_type": "host_qa",
+                            "worker_role": (
+                                "victim_validation"
+                                if metadata.get("source") == "victim"
+                                else "attack_validation"
+                            ),
+                            "host_id": host_id,
+                            "shell_id": metadata.get("shell_id", ""),
+                        },
+                    )
                 if result["tool"] == "ask_human" and is_stop_response(result["result"]):
                     stopped = True
             if stopped:
@@ -878,7 +1262,9 @@ class AssessmentExecutor:
         for finding in findings:
             finding.host_id = finding.host_id or host_id
             finding.assessment_id = assessment_id
-            finding.source = mode
+            if finding.source not in {"attacker", "victim", "control-plane"}:
+                finding.source = mode
+        expectations = list(local_knowledge.assessment_expectations.values())
         if not findings:
             findings.append(AssessmentFinding(
                 finding_id=f"{assessment_id}-summary",
@@ -899,6 +1285,14 @@ class AssessmentExecutor:
             "warning" if any(item.severity in {"high", "medium"} for item in findings)
             else "pass"
         )
+        worker_roles = [
+            "qa_supervisor",
+            "common_host_qa",
+            "attack_validation",
+            "evidence_synthesis",
+        ]
+        if self.victim_adapter:
+            worker_roles.insert(3, "victim_validation")
         return AssessmentResult(
             assessment_id=assessment_id,
             scope="host",
@@ -907,7 +1301,16 @@ class AssessmentExecutor:
             status=status,
             summary=summary,
             findings=findings,
-            evidence=[],
+            evidence=tool_evidence,
             started_at=started_at,
             completed_at=_now(),
+            metadata={
+                "worker_type": "host_qa",
+                "host_id": host_id,
+                "worker_roles": worker_roles,
+                "expectation_manifest_version": local_knowledge.expectation_manifest_version,
+                "expectations": expectations,
+                "shell_sessions": list(local_knowledge.shell_sessions.values()),
+                "privilege_events": list(local_knowledge.privilege_events),
+            },
         )
