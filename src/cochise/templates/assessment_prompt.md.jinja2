@@ -18,6 +18,12 @@ expectations, mark inferred assumptions, and verify both against evidence. If
 the specification is incomplete, continue with black-box discovery and record
 what remains unknown.
 
+The context may also include `human_qa_instructions`, written by a QA engineer
+in natural language (for example, checks derived from threat intelligence).
+Treat those instructions as the requested QA objective: translate them into
+applicable checks and evidence, but do not execute the file as a script or
+assume that every named technique applies to every host.
+
 The goal is to establish whether this host is built correctly and whether the
 existing attack workflow is technically feasible. This is an authorized Cyber
 Range. Complete both stages below.

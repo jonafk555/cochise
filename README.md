@@ -176,6 +176,17 @@ for the LLM ('attack the AD network'). It also contains the target IP range (har
 uv run cochise
 ```
 
+An authorized human QA engineer can add natural-language, threat-informed QA
+guidance without changing the range spec:
+
+```bash
+uv run cochise --qa-instructions specs/human-qa.md
+```
+
+The file is passed to the QA LLM as semantic intent. It can use free-form
+Markdown or plain text and is never executed as a script. The run records its
+path, format, character count, and SHA-256 in the QA report metadata.
+
 Cochise will create a timestamped JSON log in `logs/` capturing every LLM call, command execution, and discovered credential. The Cyber Range QA report is continuously updated at `QA_REPORT_PATH` (default: `logs/qa-report.md`) after the global preflight and every host assessment. Large adapter/tool evidence is deduplicated into one `artifact-manifest.jsonl` under `QA_ARTIFACT_DIR` or alongside the report in `artifacts/`; raw trajectory logs remain unchanged.
 
 ### Human-in-the-loop

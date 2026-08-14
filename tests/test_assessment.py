@@ -14,6 +14,7 @@ from cochise.assessment import (
     VictimCommandRouter,
 )
 from cochise.knowledge import Knowledge
+from cochise.qa_guidance import load_qa_guidance
 from cochise.qa_report import QAReportWriter
 
 
@@ -257,6 +258,44 @@ class AssessmentTests(unittest.TestCase):
                 item.get("source") == "control-plane"
                 for item in result.to_dict()["evidence"]
             ))
+
+        asyncio.run(scenario())
+
+    def test_human_qa_guidance_reaches_host_worker_context(self):
+        async def runner(command, technique, procedure):
+            return {"output": "Host is up", "exit_status": 0}
+
+        async def host_assessor(host_id, context, mode):
+            self.assertIn("human_qa_instructions", context)
+            self.assertIn("threat-intelligence", context)
+            return AssessmentResult(
+                assessment_id="assessment-guided",
+                scope="host",
+                mode=mode,
+                target=host_id,
+                status="pass",
+                summary="guided host QA completed",
+            )
+
+        async def scenario():
+            logger = FakeLogger()
+            knowledge = Knowledge(logger)
+            await knowledge.register_host_access("linux-web", ip_addresses="10.0.0.30")
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "qa.md"
+                path.write_text(
+                    "Use threat-intelligence to validate the web-to-Linux pivot.",
+                    encoding="utf-8",
+                )
+                coordinator = RangeAssessmentCoordinator(
+                    BlackBoxRangeAdapter(runner),
+                    logger,
+                    host_assessor=host_assessor,
+                    qa_guidance=load_qa_guidance(path),
+                )
+                result = await coordinator.assess_host("linux-web", knowledge)
+                self.assertIsNotNone(result)
+                self.assertEqual(result.metadata["human_qa_guidance"]["format"], "markdown")
 
         asyncio.run(scenario())
 

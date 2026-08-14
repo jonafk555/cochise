@@ -34,6 +34,7 @@ from cochise.executor import perform_tool_call
 from cochise.human_interaction import HumanInteraction, is_stop_response
 from cochise.knowledge import Knowledge
 from cochise.qa_report import QAReportWriter
+from cochise.qa_guidance import QAGuidance
 
 
 TEMPLATE_DIR = pathlib.Path(__file__).parent / "templates"
@@ -796,12 +797,14 @@ class RangeAssessmentCoordinator:
         spec: RangeSpec | None = None,
         host_assessor: HostAssessor | None = None,
         report_writer: QAReportWriter | None = None,
+        qa_guidance: QAGuidance | None = None,
     ) -> None:
         self.adapter = adapter
         self.logger = logger
         self.spec = spec
         self.host_assessor = host_assessor
         self.report_writer = report_writer
+        self.qa_guidance = qa_guidance
         self.global_result: AssessmentResult | None = None
 
     async def run_global_preflight(self, knowledge: Knowledge) -> AssessmentResult:
@@ -871,6 +874,9 @@ class RangeAssessmentCoordinator:
                 "spec_format": self.spec.format if self.spec else "blackbox",
                 "spec_hash": self.spec.content_hash if self.spec else "",
                 "worker_type": "global_discovery",
+                "human_qa_guidance": self.qa_guidance.metadata()
+                if self.qa_guidance
+                else {},
             },
         )
         knowledge.record_assessment_result(result)
@@ -943,6 +949,11 @@ class RangeAssessmentCoordinator:
                 ),
                 "spec_format": self.spec.format if self.spec else "blackbox",
                 "spec_hash": self.spec.content_hash if self.spec else "",
+                "human_qa_instructions": (
+                    self.qa_guidance.semantic_context(max_chars=40_000)
+                    if self.qa_guidance
+                    else ""
+                ),
                 "adapter_evidence": evidence,
                 "current_knowledge": knowledge.get_compact_knowledge(),
                 "active_shell_sessions": knowledge.get_shell_sessions_context(),
@@ -971,6 +982,9 @@ class RangeAssessmentCoordinator:
                     "spec_source": self.spec.source if self.spec else "",
                     "spec_format": self.spec.format if self.spec else "blackbox",
                     "spec_hash": self.spec.content_hash if self.spec else "",
+                    "human_qa_guidance": self.qa_guidance.metadata()
+                    if self.qa_guidance
+                    else {},
                 }
             except Exception as exc:
                 adapter_findings.append(_adapter_failure_finding(
@@ -991,7 +1005,13 @@ class RangeAssessmentCoordinator:
                     evidence=evidence,
                     started_at=started_at,
                     completed_at=_now(),
-                    metadata={"worker_type": "host_qa", "host_id": host_id},
+                    metadata={
+                        "worker_type": "host_qa",
+                        "host_id": host_id,
+                        "human_qa_guidance": self.qa_guidance.metadata()
+                        if self.qa_guidance
+                        else {},
+                    },
                 )
         else:
             findings = adapter_findings
@@ -1023,7 +1043,13 @@ class RangeAssessmentCoordinator:
                 evidence=evidence,
                 started_at=started_at,
                 completed_at=_now(),
-                metadata={"worker_type": "host_qa", "host_id": host_id},
+                metadata={
+                    "worker_type": "host_qa",
+                    "host_id": host_id,
+                    "human_qa_guidance": self.qa_guidance.metadata()
+                    if self.qa_guidance
+                    else {},
+                },
             )
 
         knowledge.record_assessment_result(result)
@@ -1048,6 +1074,7 @@ class AssessmentExecutor:
         human_interaction: HumanInteraction | None = None,
         victim_adapter: VictimCommandRouter | None = None,
         report_writer: QAReportWriter | None = None,
+        qa_guidance: QAGuidance | None = None,
     ) -> None:
         self.model = model
         self.api_key = api_key
@@ -1057,6 +1084,7 @@ class AssessmentExecutor:
         self.human_interaction = human_interaction or HumanInteraction(logger.console)
         self.victim_adapter = victim_adapter
         self.report_writer = report_writer
+        self.qa_guidance = qa_guidance
 
     async def ask_human(self, question: str, reason: str) -> str:
         return await self.human_interaction.ask_human(question, reason)
@@ -1076,6 +1104,20 @@ class AssessmentExecutor:
             # Custom host assessors may pass a non-JSON context; retain the
             # existing local ID fallback for compatibility.
             pass
+        if self.qa_guidance:
+            try:
+                parsed_context = json.loads(context)
+                if isinstance(parsed_context, dict) and not parsed_context.get(
+                    "human_qa_instructions"
+                ):
+                    parsed_context["human_qa_instructions"] = (
+                        self.qa_guidance.semantic_context(max_chars=40_000)
+                    )
+                    context = json.dumps(parsed_context, ensure_ascii=False, indent=2)
+            except (TypeError, json.JSONDecodeError):
+                # Preserve compatibility with custom callers that use a
+                # non-JSON context string.
+                pass
         started_at = _now()
         local_knowledge = Knowledge(self.logger)
         if self.report_writer:
@@ -1312,5 +1354,8 @@ class AssessmentExecutor:
                 "expectations": expectations,
                 "shell_sessions": list(local_knowledge.shell_sessions.values()),
                 "privilege_events": list(local_knowledge.privilege_events),
+                "human_qa_guidance": self.qa_guidance.metadata()
+                if self.qa_guidance
+                else {},
             },
         )

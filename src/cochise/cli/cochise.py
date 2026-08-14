@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import litellm
 import os
@@ -20,6 +21,7 @@ from cochise.executor import ExecutorFactory
 from cochise.human_interaction import HumanInteraction
 from cochise.planner import Planner
 from cochise.logger import Logger
+from cochise.qa_guidance import load_qa_guidance
 from cochise.qa_report import QAReportWriter
 from cochise.ssh_connection import get_ssh_connection_from_env
 
@@ -37,11 +39,37 @@ def _configured_networks() -> list[str]:
     value = os.getenv("RANGE_NETWORKS", "")
     return [item.strip() for item in value.replace(";", ",").split(",") if item.strip()]
 
-async def async_main() -> None:
+
+def _argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run Cochise with optional human-authored QA guidance."
+    )
+    parser.add_argument(
+        "--qa-instructions",
+        "--qa-file",
+        "--qa-guidance",
+        "--human-qa",
+        dest="qa_instructions",
+        metavar="PATH",
+        help=(
+            "UTF-8 Markdown/text written by a human QA engineer. The LLM "
+            "interprets it as semantic QA intent."
+        ),
+    )
+    return parser
+
+
+def _parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    return _argument_parser().parse_args(argv)
+
+
+async def async_main(argv: list[str] | None = None) -> None:
 
     # setup configuration from environment variables
     # Treat the project .env as the authoritative runtime configuration.
     load_dotenv(override=True)
+    args = _parse_arguments(argv)
+    qa_guidance = load_qa_guidance(args.qa_instructions) if args.qa_instructions else None
     # Resolve the selected provider once and share the same connection details
     # with the planner and every short-lived executor.
     llm_config = get_llm_config_from_env()
@@ -89,6 +117,7 @@ async def async_main() -> None:
         "planner_max_context_size": planner_max_context_size,
         "planner_max_interactions": planner_max_interactions,
         "human_interaction": human_interaction_enabled,
+        "qa_instructions": qa_guidance.metadata() if qa_guidance else {},
     }, output=False)
 
     # open SSH connection
@@ -117,6 +146,7 @@ async def async_main() -> None:
             "control_plane": bool(control_plane),
             "victim_validation": bool(victim_adapter),
             "artifact_dir": qa_artifact_dir or "<report-dir>/artifacts",
+            "qa_instructions": qa_guidance.metadata() if qa_guidance else {},
         },
     )
     logger.log_data("qa_report", str(qa_report.path), output=False)
@@ -133,6 +163,7 @@ async def async_main() -> None:
         human_interaction,
         victim_adapter=victim_adapter,
         report_writer=qa_report,
+        qa_guidance=qa_guidance,
     )
     assessment_coordinator = RangeAssessmentCoordinator(
         range_adapter,
@@ -140,6 +171,7 @@ async def async_main() -> None:
         range_spec if range_mode == "whitebox" else None,
         assessment_executor.assess_host,
         report_writer=qa_report,
+        qa_guidance=qa_guidance,
     )
     executor_factory = ExecutorFactory(
         llm_config,
@@ -171,4 +203,9 @@ async def async_main() -> None:
     else:
         qa_report.finalize("completed")
 
-asyncio.run(async_main())
+def main() -> None:
+    asyncio.run(async_main())
+
+
+if __name__ == "__main__":
+    main()

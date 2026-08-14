@@ -99,6 +99,9 @@ The assessment coordinator provides two mandatory gates:
    spec can add expected topology and host facts; the LLM interprets the raw
    document and creates a versioned semantic expectation manifest rather than
    requiring fixed fields.
+   A human QA engineer can additionally pass free-form guidance at process
+   startup with `--qa-instructions path/to/human-qa.md`; this is semantic QA
+   intent and is never executed as a script.
 2. The Executor calls `register_host_access` after confirming a newly accessed
    host. Before the Planner selects another ordinary task, a short-lived LLM
    QA supervisor/host worker performs read-only inventory and then
