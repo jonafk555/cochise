@@ -145,26 +145,73 @@ with fully-qualified LiteLLM model names such as
 tool/function calling because Cochise delegates SSH and knowledge-base actions
 through tools.
 
-Cyber Range assessment is mandatory. Black-box mode collects evidence from the
-attacker VM; white-box mode additionally compares observations with a
-user-supplied YAML, JSON, Markdown, or natural-language document. Structured
-fields are optional hints; the LLM semantically interprets the raw document
-and versions the expectation manifest. A global preflight runs before
-the Planner creates an attack plan. Every newly accessed host must then pass a
-read-only inventory and attack-feasibility assessment before ordinary attack
-work continues. Blocking findings pause the run and request human guidance;
-with `HUMAN_INTERACTION=0`, the run continues autonomously and records the
-override. The system does not automatically repair the range. A management-plane
-adapter can be supplied with `RANGE_CONTROL_PLANE_MODULE=module:factory`; it must
-implement `collect_global(spec)` and `collect_host(host_id, host, spec)`.
-An optional victim-side adapter can be supplied with
-`RANGE_VICTIM_MODULE=module:factory`; it implements
-`execute_victim_command(host_id, command, purpose, shell_id)` and keeps victim
-evidence separate from attacker evidence. The assessment worker records the
-shell ID, effective identity, and privilege changes so subsequent attack
-validation uses the correct reverse shell. Every host uses the common baseline
-and then the applicable Windows endpoint, Windows AD, or Linux checks; domain
-membership is determined from evidence rather than assumed.
+### Cyber Range QA
+
+QA is part of the normal `cochise` run rather than a separate command. It is
+intended for an authorized, isolated Cyber Range only. The Planner and ordinary
+Executor remain LLM-driven; Python supplies the SSH, adapter, state, gate, and
+reporting infrastructure.
+
+| Mode | Configuration | Behavior |
+|---|---|---|
+| Black-box (default) | `RANGE_MODE=blackbox` | Collects observations from the attacker VM without requiring range metadata. |
+| White-box | `RANGE_MODE=whitebox` and `RANGE_SPEC_PATH=...` | Adds a YAML, JSON, Markdown, plain-text, or natural-language environment document. The LLM interprets the raw content and creates a versioned semantic expectation manifest. |
+
+`TARGET_HOST` is the SSH attacker/Kali host, not automatically an AD or victim
+host. `RANGE_NETWORKS` controls the optional black-box network probes. The
+scenario objective and target range are still defined by
+`src/cochise/templates/scenario.md`.
+
+The global preflight runs before the Planner selects ordinary attack work. Each
+host declared by a structured white-box spec, or each host for which the attack
+workflow calls `register_host_access`, becomes a pending Host QA gate. The gate
+runs before the next ordinary attack task. A network address found by a global
+scan is not automatically converted into a Host QA record; it must be declared
+or confirmed by the LLM workflow.
+
+Every Host QA worker uses the common baseline and semantically selects the
+applicable checks:
+
+- Windows endpoint: workstation or server, domain-joined or standalone;
+- Windows AD: only when evidence supports a domain-controller/AD role;
+- Linux Cyber Range: AD-integrated or standalone;
+- attack-feasibility, privilege, reverse-shell, and evidence validation.
+
+The worker records `pass`, `fail`, `unknown`, `not_applicable`, or
+`blocked_by_access`. It attempts a reasonable authorized privilege-escalation
+path first, records the identity and privilege before/after the attempt, and
+does not invent privileged observations.
+
+Blocking findings pause for human guidance when `HUMAN_INTERACTION=1`. With
+`HUMAN_INTERACTION=0`, the run continues autonomously and records an explicit
+override; Cochise does not automatically repair the range.
+
+Optional management-plane evidence can be added with
+`RANGE_CONTROL_PLANE_MODULE=module:factory`. The factory must return an object
+implementing:
+
+```python
+async def collect_global(spec): ...
+async def collect_host(host_id, host, spec): ...
+```
+
+Optional victim-side QA can be added with
+`RANGE_VICTIM_MODULE=module:factory`. The factory must return an object with:
+
+```python
+async def execute_victim_command(
+    host_id, command, purpose="", shell_id=""
+): ...
+```
+
+It may also implement `execute_shell_command(shell_id, command, purpose="")`
+for persistent victim sessions. The adapter owns WinRM, PowerShell Remoting,
+Linux SSH/agent, AD management, and session transport; Cochise only routes the
+LLM request and records attacker/victim provenance. Without this adapter, QA is
+attacker-side only. A reverse shell should be registered with a stable
+`shell_id`, host, identity, privilege, working directory, and transport. The
+core records and passes that ID to the LLM, while persistent shell transport
+remains adapter-owned.
 
 ### Run
 
@@ -187,7 +234,31 @@ The file is passed to the QA LLM as semantic intent. It can use free-form
 Markdown or plain text and is never executed as a script. The run records its
 path, format, character count, and SHA-256 in the QA report metadata.
 
-Cochise will create a timestamped JSON log in `logs/` capturing every LLM call, command execution, and discovered credential. The Cyber Range QA report is continuously updated at `QA_REPORT_PATH` (default: `logs/qa-report.md`) after the global preflight and every host assessment. Large adapter/tool evidence is deduplicated into one `artifact-manifest.jsonl` under `QA_ARTIFACT_DIR` or alongside the report in `artifacts/`; raw trajectory logs remain unchanged.
+To use a white-box spec and human QA guidance together:
+
+```bash
+RANGE_MODE=whitebox \
+RANGE_SPEC_PATH=specs/range.md \
+uv run cochise --qa-instructions specs/human-qa.md
+```
+
+The human guidance file is an additional semantic QA objective; it does not
+replace `RANGE_SPEC_PATH` and is never executed as a script. The LLM decides
+which checks apply and must support each conclusion with observed evidence.
+
+The report can be watched while the run is active:
+
+```bash
+tail -f logs/qa-report.md
+```
+
+Cochise creates a timestamped JSON trajectory in `logs/` containing LLM calls,
+tool calls, command results, and discovered credentials. The Markdown QA report
+is atomically refreshed after global discovery, each Host QA progress update,
+and each completed assessment. In white-box mode it includes the expectation
+manifest, coverage, and conformance. Large evidence is deduplicated by content
+hash into one `artifact-manifest.jsonl` under `QA_ARTIFACT_DIR`, or by default in
+`logs/artifacts/`; the raw trajectory remains authoritative.
 
 ### Human-in-the-loop
 
