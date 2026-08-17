@@ -1,12 +1,18 @@
 import asyncio
-import json
 import pathlib
 
 from jinja2 import Template
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn,TimeElapsedColumn
 
-from cochise.common import is_tool_call, LLMFunctionMapping, llm_call, llm_tool_call, message_to_json
+from cochise.common import (
+    LLMFunctionMapping,
+    is_tool_call,
+    llm_call,
+    llm_tool_call,
+    message_to_json,
+    parse_tool_call,
+)
 from cochise.human_interaction import HumanInteraction, is_stop_response
 from cochise.knowledge import Knowledge
 
@@ -46,10 +52,14 @@ async def perform_tool_call(id, tool_name, function, args):
             if key not in {"output", "stdout", "stderr"}
         }
 
+    output = result['output'] if isinstance(result, dict) and 'output' in result else result
+    if not isinstance(output, str):
+        output = str(output)
+
     return {
         'tool': tool_name,
         'cmd': args['command'] if 'command' in args else tool_name,
-        'result': result['output'] if isinstance(result, dict) and 'output' in result else str(result),
+        'result': output,
         'exit_status': result['exit_status'] if isinstance(result, dict) and 'exit_status' in result else None,
         'metadata': metadata,
         'tool_call_id': id
@@ -221,13 +231,39 @@ class Executor:
                 tool_calls = []
                 tool_results = {}
                 for tool_call in response_message.tool_calls:
-                    function_name = tool_call.function.name
-                    args = json.loads(tool_call.function.arguments)
+                    function_name, args, parse_error = parse_tool_call(tool_call)
+                    tool_call_id = getattr(tool_call, "id", "")
                     tool_calls.append((tool_call, function_name, args))
-                    self.logger.log_tool_call(function_name, tool_call.id, args, output=False)
+                    if parse_error:
+                        tool_results[tool_call_id] = {
+                            'tool': function_name,
+                            'cmd': function_name,
+                            'result': parse_error,
+                            'exit_status': None,
+                            'metadata': {},
+                            'tool_call_id': tool_call_id,
+                        }
+                        continue
+                    if not tools.has_function(function_name):
+                        tool_results[tool_call_id] = {
+                            'tool': function_name,
+                            'cmd': function_name,
+                            'result': (
+                                f"Unknown tool '{function_name}'. Choose one of: "
+                                f"{', '.join(tools.mapping)}."
+                            ),
+                            'exit_status': None,
+                            'metadata': {},
+                            'tool_call_id': tool_call_id,
+                        }
+                        continue
+                    self.logger.log_tool_call(function_name, tool_call_id, args, output=False)
 
                 command_calls = [
-                    item for item in tool_calls if item[1] != "ask_human"
+                    item for item in tool_calls
+                    if item[1] != "ask_human"
+                    and item[2] is not None
+                    and getattr(item[0], "id", "") not in tool_results
                 ]
                 if command_calls:
                     tasks = []
@@ -271,7 +307,11 @@ class Executor:
                 # terminal.  They are still represented as normal tool results
                 # so the assistant tool-call/result ordering remains valid.
                 for tool_call, function_name, args in tool_calls:
-                    if function_name == "ask_human":
+                    if (
+                        function_name == "ask_human"
+                        and args is not None
+                        and getattr(tool_call, "id", "") not in tool_results
+                    ):
                         tool_results[tool_call.id] = await perform_tool_call(
                             tool_call.id,
                             function_name,
@@ -283,7 +323,16 @@ class Executor:
                 # calls.  In particular, never insert a user message before a
                 # required tool result.
                 for tool_call, _function_name, _args in tool_calls:
-                    result = tool_results[tool_call.id]
+                    result = tool_results.get(tool_call.id)
+                    if result is None:
+                        result = {
+                            'tool': _function_name,
+                            'cmd': _function_name,
+                            'result': "Tool call failed before execution.",
+                            'exit_status': None,
+                            'metadata': {},
+                            'tool_call_id': tool_call.id,
+                        }
                     self.logger.log_tool_result(
                         result['tool'],
                         result['tool_call_id'],

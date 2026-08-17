@@ -1,12 +1,18 @@
 import datetime
-import json
 import pathlib
 
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.pretty import Pretty
 
-from cochise.common import LLMFunctionMapping, is_tool_call, llm_call, llm_tool_call, message_to_json
+from cochise.common import (
+    LLMFunctionMapping,
+    is_tool_call,
+    llm_call,
+    llm_tool_call,
+    message_to_json,
+    parse_tool_call,
+)
 from cochise.human_interaction import HumanInteraction, is_stop_response
 from cochise.knowledge import Knowledge
 from cochise.logger import Logger
@@ -125,6 +131,19 @@ class Planner:
         self.history.append(message)
         self.logger.log_append_to_history(message, "assessment", output=False)
 
+    def _build_tool_mapping(self, executor) -> LLMFunctionMapping:
+        """Build the Planner tool surface advertised to the LLM."""
+
+        return LLMFunctionMapping([
+            executor.perform_task,
+            self.ask_human,
+            self.knowledge.register_host_access,
+            self.knowledge.add_compromised_account,
+            self.knowledge.update_compromised_account,
+            self.knowledge.add_entity_information,
+            self.knowledge.update_entity_information,
+        ])
+
     async def _run_global_preflight(self) -> bool:
         if self.assessment_coordinator is None or self.preflight_complete:
             return True
@@ -195,11 +214,25 @@ class Planner:
 
     async def handle_tool_calls(self, response_message, executor, tool_mapping):
         for tool_call in response_message.tool_calls:
-            function_name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments)
+            function_name, args, parse_error = parse_tool_call(tool_call)
+            tool_call_id = getattr(tool_call, "id", "")
+
+            if parse_error:
+                self._append_tool_error(tool_call_id, function_name, parse_error)
+                continue
+
+            if not tool_mapping.has_function(function_name):
+                self._append_tool_error(
+                    tool_call_id,
+                    function_name,
+                    (
+                        f"Unknown tool '{function_name}'. Choose one of: "
+                        f"{', '.join(tool_mapping.mapping)}."
+                    ),
+                )
+                continue
 
             self.logger.log_tool_call(function_name, tool_call.id, args, output=False)
-            function_to_call = tool_mapping.get_function(function_name)
 
             # this could be cleaner:
             # set tool call id in the executor logger, just in case the executor is run
@@ -211,19 +244,12 @@ class Planner:
             # error and feed it back as the tool result so the LLM can retry
             # instead of crashing the planner loop.
             try:
+                function_to_call = tool_mapping.get_function(function_name)
                 raw_result = await function_to_call(**args)
             except Exception as e:
                 error = (f"Error calling {function_name} with arguments {args}: {e}. "
                          "Please call the tool again, supplying all required arguments as described in its specification.")
-                self.logger.log_tool_result(function_name, tool_call.id, error, output=True)
-                msg = {
-                    "role": "tool",
-                    "name": function_name,
-                    "content": error,
-                    "tool_call_id": tool_call.id
-                }
-                self.logger.log_append_to_history(msg, "manual", output=False)
-                self.history.append(msg)
+                self._append_tool_error(tool_call.id, function_name, error)
                 continue
 
             if isinstance(raw_result, tuple):
@@ -251,6 +277,19 @@ class Planner:
 
             self.logger.log_append_to_history(msg, "agent", output=False)
             self.history.append(msg)
+
+    def _append_tool_error(self, tool_call_id: str, function_name: str, error: str) -> None:
+        """Return a schema-valid tool error so the LLM can repair its call."""
+
+        self.logger.log_tool_result(function_name, tool_call_id, error, output=True)
+        msg = {
+            "role": "tool",
+            "name": function_name,
+            "content": str(error),
+            "tool_call_id": tool_call_id,
+        }
+        self.logger.log_append_to_history(msg, "manual", output=False)
+        self.history.append(msg)
 
     
     async def engage(self) -> None:
@@ -305,18 +344,11 @@ class Planner:
             # the task at hand.
             executor = self.executor_factory.build(self.knowledge)
 
-            # Keep the persistent planner's tool surface identical to the
-            # upstream Cochise architecture: it delegates work and maintains
-            # the shared attack knowledge.  Host assessment, victim/shell
-            # validation and human-gate tools belong to the executor/QA
-            # workers, not to this strategic tool call.
-            tool_mapping = LLMFunctionMapping([
-                executor.perform_task,
-                self.knowledge.add_compromised_account,
-                self.knowledge.update_compromised_account,
-                self.knowledge.add_entity_information,
-                self.knowledge.update_entity_information,
-            ])
+            # The planner can delegate work, record newly confirmed access,
+            # update shared knowledge, or ask for human guidance when no safe
+            # next task is available.  Keep this surface aligned with the
+            # planner prompt so the model never sees an unavailable tool.
+            tool_mapping = self._build_tool_mapping(executor)
 
             # TODO: we need some error handling here (in case of misformed tool calls)
             with self.logger.console.status("[bold green]llm-call: select next task to perform"):

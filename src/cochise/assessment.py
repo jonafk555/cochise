@@ -29,6 +29,7 @@ from cochise.common import (
     llm_call,
     llm_tool_call,
     message_to_json,
+    parse_tool_call,
 )
 from cochise.executor import perform_tool_call
 from cochise.human_interaction import HumanInteraction, is_stop_response
@@ -1191,14 +1192,40 @@ class AssessmentExecutor:
                 history.append({"role": "user", "content": "Continue the assessment and record findings."})
                 continue
 
+            tool_calls = []
+            tool_results = {}
             tasks = []
             for tool_call in response_message.tool_calls:
-                function_name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments)
-                self.logger.log_tool_call(function_name, tool_call.id, args, output=False)
+                function_name, args, parse_error = parse_tool_call(tool_call)
+                tool_call_id = getattr(tool_call, "id", "")
+                tool_calls.append((tool_call, function_name, args))
+                if parse_error:
+                    tool_results[tool_call_id] = {
+                        "tool": function_name,
+                        "cmd": function_name,
+                        "result": parse_error,
+                        "exit_status": None,
+                        "metadata": {},
+                        "tool_call_id": tool_call_id,
+                    }
+                    continue
+                if not tools.has_function(function_name):
+                    tool_results[tool_call_id] = {
+                        "tool": function_name,
+                        "cmd": function_name,
+                        "result": (
+                            f"Unknown tool '{function_name}'. Choose one of: "
+                            f"{', '.join(tools.mapping)}."
+                        ),
+                        "exit_status": None,
+                        "metadata": {},
+                        "tool_call_id": tool_call_id,
+                    }
+                    continue
+                self.logger.log_tool_call(function_name, tool_call_id, args, output=False)
                 tasks.append(asyncio.create_task(
                     perform_tool_call(
-                        tool_call.id,
+                        tool_call_id,
                         function_name,
                         tools.get_function(function_name),
                         args,
@@ -1206,6 +1233,10 @@ class AssessmentExecutor:
                 ))
             for task in asyncio.as_completed(tasks):
                 result = await task
+                tool_results[result["tool_call_id"]] = result
+
+            for tool_call, function_name, args in tool_calls:
+                result = tool_results[getattr(tool_call, "id", "")]
                 tool_result_count += 1
                 self.logger.log_tool_result(
                     result["tool"],

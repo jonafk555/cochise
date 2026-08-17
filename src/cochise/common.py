@@ -1,6 +1,7 @@
 import datetime
 import functools
 import inspect
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, get_type_hints
@@ -234,6 +235,43 @@ def is_tool_call(msg) -> bool:
     return hasattr(msg, "tool_calls") and msg.tool_calls is not None and len(msg.tool_calls) > 0
 
 
+def parse_tool_call(tool_call) -> tuple[str, dict[str, Any] | None, str | None]:
+    """Extract and validate one provider-returned tool call.
+
+    Providers occasionally return malformed JSON arguments, a non-object
+    argument value, or a tool call without a function name.  Keep those
+    failures at the tool boundary so callers can append a valid tool result
+    and let the model retry instead of crashing the agent loop.
+    """
+
+    function = getattr(tool_call, "function", None)
+    function_name = str(getattr(function, "name", "") or "")
+    if not function_name:
+        return "unknown", None, "The tool call did not include a function name."
+
+    raw_arguments = getattr(function, "arguments", "{}")
+    if isinstance(raw_arguments, dict):
+        arguments = raw_arguments
+    elif isinstance(raw_arguments, str):
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError as exc:
+            return function_name, None, (
+                f"Invalid JSON arguments for tool {function_name}: {exc}. "
+                "Return a JSON object matching the tool schema."
+            )
+    else:
+        return function_name, None, (
+            f"Invalid arguments for tool {function_name}: expected a JSON object."
+        )
+
+    if not isinstance(arguments, dict):
+        return function_name, None, (
+            f"Invalid arguments for tool {function_name}: expected a JSON object."
+        )
+    return function_name, arguments, None
+
+
 class LLMFunctionMapping:
     def __init__(self, tool_functions: list[Callable]):
         self.tools = []
@@ -250,6 +288,9 @@ class LLMFunctionMapping:
 
     def get_function(self, value) -> Callable:
         return self.mapping[value]
+
+    def has_function(self, value: str) -> bool:
+        return value in self.mapping
 
 
 def _function_to_dict(function: Callable) -> dict[str, Any]:
