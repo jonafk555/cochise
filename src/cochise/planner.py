@@ -21,6 +21,8 @@ TEMPLATE_DIR = pathlib.Path(__file__).parent / "templates"
 
 PLANNER_STRUCTURE = (TEMPLATE_DIR / "planner_structure.md").read_text()
 PROMPT = (TEMPLATE_DIR / "planner_prompt.md").read_text()
+MAX_AUTONOMOUS_NO_PROGRESS_ROUNDS = 3
+MAX_TOOL_REPAIR_ROUNDS = 3
 
 class Planner:
     
@@ -59,6 +61,28 @@ class Planner:
         else:
             self.PLANNER_INITIAL_STRUCTURE = PLANNER_STRUCTURE + "\n\n# Task\n\nProvide the hierarchical task plan as answer. Do not include a title or an appendix."
             self.SCENARIO_AND_STRUCTURE = self.scenario + "\n\n# Task Plan Creation and Evolution\n\n" + PLANNER_STRUCTURE
+
+    def _planner_execution_prompt(self) -> str:
+        """Return the task-selection contract for the current interaction mode."""
+
+        if getattr(self.human_interaction, "enabled", True):
+            return PROMPT
+        return (
+            PROMPT
+            + "\n\nAutonomous execution mode is enabled. Do not call ask_human. "
+            "You MUST call perform_task for the most promising executable task; "
+            "the worker will handle bounded recovery autonomously."
+        )
+
+    def _planner_tool_choice(self) -> dict[str, object] | None:
+        """Require executable work when no human can answer a planner prompt."""
+
+        if getattr(self.human_interaction, "enabled", True):
+            return None
+        return {
+            "type": "function",
+            "function": {"name": "perform_task"},
+        }
 
     def _planner_system_context(self) -> str:
         assessment = self.knowledge.get_knowledge()
@@ -114,7 +138,7 @@ class Planner:
             { "role": "system", "content": self._planner_system_context()},
             { "role": "user", "content": "Create me an initial plan to achieve the overall objective. Break down the overall objective into smaller tasks and subtasks. Do not include generic steps, only very specific ones that are directly relevant for achieving the overall objective. Be concise." },
             { "role": "assistant", "content": f"# Initial Plan\n\n{plan}\n\n\n # Gathered Findings\n\n{self.knowledge.get_knowledge()}" },
-            { "role": "user", "content": PROMPT } # always finish with user prompt
+            { "role": "user", "content": self._planner_execution_prompt() } # always finish with user prompt
         ]
         self.logger.log_append_to_history(self.history, "manual", False)
 
@@ -213,15 +237,19 @@ class Planner:
         return True
 
     async def handle_tool_calls(self, response_message, executor, tool_mapping):
+        progressed = False
+        errors = 0
         for tool_call in response_message.tool_calls:
             function_name, args, parse_error = parse_tool_call(tool_call)
             tool_call_id = getattr(tool_call, "id", "")
 
             if parse_error:
+                errors += 1
                 self._append_tool_error(tool_call_id, function_name, parse_error)
                 continue
 
             if not tool_mapping.has_function(function_name):
+                errors += 1
                 self._append_tool_error(
                     tool_call_id,
                     function_name,
@@ -232,11 +260,11 @@ class Planner:
                 )
                 continue
 
-            self.logger.log_tool_call(function_name, tool_call.id, args, output=False)
+            self.logger.log_tool_call(function_name, tool_call_id, args, output=False)
 
             # this could be cleaner:
             # set tool call id in the executor logger, just in case the executor is run
-            executor.setLogger(Logger(self.logger.console, tool_call.id, self.logger.logger))
+            executor.setLogger(Logger(self.logger.console, tool_call_id, self.logger.logger))
 
             # call the method. The LLM frequently supplies tool calls that do not
             # match the specification (e.g. omitting the MITRE ATT&CK
@@ -247,9 +275,10 @@ class Planner:
                 function_to_call = tool_mapping.get_function(function_name)
                 raw_result = await function_to_call(**args)
             except Exception as e:
+                errors += 1
                 error = (f"Error calling {function_name} with arguments {args}: {e}. "
                          "Please call the tool again, supplying all required arguments as described in its specification.")
-                self._append_tool_error(tool_call.id, function_name, error)
+                self._append_tool_error(tool_call_id, function_name, error)
                 continue
 
             if isinstance(raw_result, tuple):
@@ -266,17 +295,21 @@ class Planner:
 
             if function_name == "ask_human" and is_stop_response(str(result)):
                 self.human_stop_requested = True
+            if function_name != "ask_human":
+                progressed = True
 
-            self.logger.log_tool_result(function_name, tool_call.id, result, output=False)
+            result = str(result)
+            self.logger.log_tool_result(function_name, tool_call_id, result, output=False)
             msg = {
                 "role": "tool",
                 "name": function_name,
                 "content": result,
-                "tool_call_id": tool_call.id
+                "tool_call_id": tool_call_id
             }
 
             self.logger.log_append_to_history(msg, "agent", output=False)
             self.history.append(msg)
+        return progressed, errors
 
     def _append_tool_error(self, tool_call_id: str, function_name: str, error: str) -> None:
         """Return a schema-valid tool error so the LLM can repair its call."""
@@ -305,6 +338,8 @@ class Planner:
         interaction_counter = 0 # this is currently a round-counter actually
         last_input_tokens = 0
         non_tool_response_counter = 0
+        no_progress_rounds = 0
+        tool_repair_rounds = 0
         human_stopped = False
         started = datetime.datetime.now()
 
@@ -320,7 +355,7 @@ class Planner:
             { "role": "system", "content": self._planner_system_context() },
             { "role": "user", "content": "Create me an initial plan to achieve the overall objective. Break down the overall objective into smaller tasks and subtasks. Do not include generic steps, only very specific ones that are directly relevant for achieving the overall objective. Be concise." },
             { "role": "assistant", "content": f"# Initial Plan\n\n{plan}" },
-            { "role": "user", "content": PROMPT } # always finish with user prompt
+            { "role": "user", "content": self._planner_execution_prompt() } # always finish with user prompt
         ]
         self.logger.log_append_to_history(self.history, "manual", False)
 
@@ -350,25 +385,56 @@ class Planner:
             # planner prompt so the model never sees an unavailable tool.
             tool_mapping = self._build_tool_mapping(executor)
 
-            # TODO: we need some error handling here (in case of misformed tool calls)
+            self.logger.console.log("Planner: selecting next executable task...")
             with self.logger.console.status("[bold green]llm-call: select next task to perform"):
                 response_message, costs, duration = llm_tool_call(
                     self.model,
                     self.model_api_key,
                     tool_mapping,
-                    self.history
+                    self.history,
+                    tool_choice=self._planner_tool_choice(),
                 )
             self.logger.console.log("LLM call completed, processing response...")
+            self.logger.console.log(
+                f"Planner task-selection call completed in {duration:.2f}s."
+            )
             self.logger.log_llm_call('planner_task_selection', result=response_message, costs=costs, duration=duration, output=False)
             last_input_tokens = costs['prompt_tokens']
 
-            self.history.append(message_to_json(response_message))
-            self.logger.log_append_to_history(message_to_json(response_message), "agent", output=False)
+            response_json = message_to_json(response_message)
+            self.history.append(response_json)
+            self.logger.log_append_to_history(response_json, "agent", output=False)
 
             # IDEA: unify planner and executor tool call handling
             if is_tool_call(response_message):
                 non_tool_response_counter = 0
-                await self.handle_tool_calls(response_message, executor, tool_mapping)
+                progressed, errors = await self.handle_tool_calls(
+                    response_message,
+                    executor,
+                    tool_mapping,
+                )
+                if progressed:
+                    no_progress_rounds = 0
+                    tool_repair_rounds = 0
+                else:
+                    no_progress_rounds += 1
+                    tool_repair_rounds = tool_repair_rounds + 1 if errors else 0
+                if tool_repair_rounds >= MAX_TOOL_REPAIR_ROUNDS:
+                    self.logger.log_data(
+                        "completed",
+                        "Planner stopped after repeated tool-call repair failures.",
+                        output=True,
+                    )
+                    human_stopped = True
+                    break
+                if no_progress_rounds >= MAX_AUTONOMOUS_NO_PROGRESS_ROUNDS:
+                    self.logger.log_data(
+                        "completed",
+                        "Planner stopped after repeated rounds without executable progress.",
+                        output=True,
+                    )
+                    human_stopped = True
+                    break
                 if self.human_stop_requested:
                     human_stopped = True
                     break
@@ -380,30 +446,47 @@ class Planner:
                 # the respective tool for that. You might want to check if the LLM is able
                 # to call tools correctly.
                 non_tool_response_counter += 1
+                no_progress_rounds += 1
                 self.logger.console.print(Panel(Pretty(response_message.content), title="LLM Response Content"))
-                if non_tool_response_counter >= 2:
-                    human_response = await self.ask_human(
-                        question=(
-                            "The planner has not produced an executable task for two rounds. "
-                            "Provide missing target/file information or tell it how to proceed. "
-                            "Reply 'stop' to end the run."
-                        ),
-                        reason="The planner is stalled and returned text instead of a tool call.",
+                if (
+                    no_progress_rounds >= MAX_AUTONOMOUS_NO_PROGRESS_ROUNDS
+                    and not getattr(self.human_interaction, "enabled", True)
+                ):
+                    self.logger.log_data(
+                        "completed",
+                        "Planner stopped after repeated non-tool responses in autonomous mode.",
+                        output=True,
                     )
-                    msg = {
-                        "role": "user",
-                        "content": f"Human guidance: {human_response}",
-                    }
-                    self.logger.log_append_to_history(msg, "human", output=False)
-                    self.history.append(msg)
-                    non_tool_response_counter = 0
-                    if is_stop_response(human_response):
-                        human_stopped = True
-                        break
+                    human_stopped = True
+                    break
+                if non_tool_response_counter >= 2:
+                    if getattr(self.human_interaction, "enabled", True):
+                        human_response = await self.ask_human(
+                            question=(
+                                "The planner has not produced an executable task for two rounds. "
+                                "Provide missing target/file information or tell it how to proceed. "
+                                "Reply 'stop' to end the run."
+                            ),
+                            reason="The planner is stalled and returned text instead of a tool call.",
+                        )
+                        msg = {
+                            "role": "user",
+                            "content": f"Human guidance: {human_response}",
+                        }
+                        self.logger.log_append_to_history(msg, "human", output=False)
+                        self.history.append(msg)
+                        non_tool_response_counter = 0
+                        no_progress_rounds = 0
+                        if is_stop_response(human_response):
+                            human_stopped = True
+                            break
                 else:
                     msg = {
                         "role": "user",
-                        "content": "You MUST call the perform_task tool, or ask_human if you are blocked or missing a required file. Select the most promising incomplete task from the plan and call the appropriate tool now."
+                        "content": (
+                            "You MUST call the perform_task tool. Select the most promising "
+                            "incomplete task from the plan and call it now."
+                        ),
                     }
                     self.logger.log_append_to_history(msg, "manual", output=True)
                     self.history.append(msg)
