@@ -258,10 +258,18 @@ def _function_to_dict(function: Callable) -> dict[str, Any]:
     LiteLLM currently assumes every annotation is a type and accesses its
     ``__name__`` attribute.  Modules using ``from __future__ import
     annotations`` instead expose annotation strings, which makes LiteLLM's
-    ``function_to_dict`` fail while constructing the tool list.
+    ``function_to_dict`` fail while constructing the tool list.  LiteLLM also
+    passes the function docstring to ``NumpyDocString`` without handling a
+    missing docstring, so undocumented tools need a small adapter as well.
     """
     signature = inspect.signature(function)
-    if not any(isinstance(param.annotation, str) for param in signature.parameters.values()):
+    has_deferred_annotations = any(
+        isinstance(param.annotation, str)
+        for param in signature.parameters.values()
+    )
+    has_docstring = bool(inspect.getdoc(function))
+
+    if not has_deferred_annotations and has_docstring:
         return litellm.utils.function_to_dict(function)
 
     try:
@@ -269,7 +277,9 @@ def _function_to_dict(function: Callable) -> dict[str, Any]:
     except (NameError, TypeError):
         # Preserve LiteLLM's existing behavior for functions whose forward
         # references cannot be resolved in their defining module.
-        return litellm.utils.function_to_dict(function)
+        if has_docstring:
+            return litellm.utils.function_to_dict(function)
+        resolved = {}
 
     parameters = [
         parameter.replace(annotation=resolved.get(name, parameter.annotation))
@@ -277,6 +287,10 @@ def _function_to_dict(function: Callable) -> dict[str, Any]:
     ]
     adapter = functools.wraps(function)(lambda *args, **kwargs: function(*args, **kwargs))
     adapter.__signature__ = signature.replace(parameters=parameters)
+    if not has_docstring:
+        adapter.__doc__ = (
+            f"Execute the {function.__name__.replace('_', ' ')} tool."
+        )
     return litellm.utils.function_to_dict(adapter)
 
 

@@ -305,14 +305,17 @@ class Planner:
             # the task at hand.
             executor = self.executor_factory.build(self.knowledge)
 
+            # Keep the persistent planner's tool surface identical to the
+            # upstream Cochise architecture: it delegates work and maintains
+            # the shared attack knowledge.  Host assessment, victim/shell
+            # validation and human-gate tools belong to the executor/QA
+            # workers, not to this strategic tool call.
             tool_mapping = LLMFunctionMapping([
                 executor.perform_task,
-                self.ask_human,
-                self.knowledge.register_host_access,
                 self.knowledge.add_compromised_account,
                 self.knowledge.update_compromised_account,
                 self.knowledge.add_entity_information,
-                self.knowledge.update_entity_information
+                self.knowledge.update_entity_information,
             ])
 
             # TODO: we need some error handling here (in case of misformed tool calls)
