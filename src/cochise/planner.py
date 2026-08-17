@@ -55,6 +55,7 @@ class Planner:
 
         self.history = []
         self.knowledge = Knowledge(self.logger)
+        self._last_planner_tools = None
 
         if PLANNER_STRUCTURE is None or PLANNER_STRUCTURE == "":
             self.PLANNER_INITIAL_STRUCTURE = "Provide a task plan as answer. Do not include a title or an appendix."
@@ -139,6 +140,7 @@ class Planner:
             self.model_api_key,
             self.history,
             operation="planner history compaction",
+            tools=self._last_planner_tools,
         )
 
         plan = result["content"]
@@ -397,6 +399,7 @@ class Planner:
             # next task is available.  Keep this surface aligned with the
             # planner prompt so the model never sees an unavailable tool.
             tool_mapping = self._build_tool_mapping(executor)
+            self._last_planner_tools = tool_mapping.get_tool_definitions()
 
             self.logger.console.log("Planner: selecting next executable task...")
             with self.logger.console.status("[bold green]llm-call: select next task to perform"):

@@ -104,6 +104,37 @@ class LLMConfigTests(unittest.TestCase):
         self.assertEqual(captured["api_base"], "http://127.0.0.1:11434")
         self.assertEqual(costs["total_tokens"], 5)
 
+    def test_plain_call_preserves_tools_for_tool_history(self):
+        captured = {}
+
+        def fake_completion(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="summary"))],
+                usage=SimpleNamespace(prompt_tokens=2, completion_tokens=1),
+                _hidden_params={},
+            )
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "execute_command",
+                "description": "Execute a command",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }]
+        config = common.LLMConfig(provider="anthropic", model="anthropic/test")
+        with patch.object(common.litellm, "completion", fake_completion):
+            common.llm_call(
+                config,
+                None,
+                [{"role": "user", "content": "summarize"}],
+                operation="host assessment summary",
+                tools=tools,
+            )
+
+        self.assertEqual(captured["tools"], tools)
+
     def test_llm_healthcheck_requires_a_tool_call(self):
         captured = {}
 

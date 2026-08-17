@@ -1331,6 +1331,7 @@ class AssessmentExecutor:
                 self.api_key,
                 history,
                 operation="host assessment summary",
+                tools=tools.get_tool_definitions(),
             )
             self.logger.log_llm_call("assessment_host_summary", result, costs, duration, output=False)
             summary = result.get("content") or "The assessment did not produce a summary."

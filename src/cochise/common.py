@@ -580,15 +580,19 @@ def llm_call(
     api_key: str | None,
     messages: list[dict[str, Any]],
     operation: str = "completion",
+    tools: list[dict[str, Any]] | None = None,
 ):
     """make a simple LLM call without any response format parsing"""
 
     tik = datetime.datetime.now()
+    completion_kwargs = {
+        "messages": messages,
+        **_completion_kwargs(model, api_key),
+    }
+    if tools is not None:
+        completion_kwargs["tools"] = tools
     response = _completion_with_retry(
-        {
-            "messages": messages,
-            **_completion_kwargs(model, api_key),
-        },
+        completion_kwargs,
         operation=operation,
     )
     tok = datetime.datetime.now()

@@ -424,6 +424,7 @@ class Executor:
                 self.api_key,
                 history,
                 operation="executor summary",
+                tools=tools.get_tool_definitions(),
             )
             self.logger.log_llm_call('executor_no_summary', result, costs, duration, output=True)
 
