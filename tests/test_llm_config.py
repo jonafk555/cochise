@@ -129,6 +129,27 @@ class LLMConfigTests(unittest.TestCase):
         self.assertEqual(captured["tool_choice"]["type"], "function")
         self.assertEqual(costs["total_tokens"], 2)
 
+    def test_network_failure_is_wrapped_and_retried_once(self):
+        config = common.LLMConfig(provider="anthropic", model="anthropic/test")
+        failure = RuntimeError("[Errno 101] Network is unreachable")
+
+        with patch.dict(
+            os.environ,
+            {"LLM_MAX_RETRIES": "1", "LLM_RETRY_BACKOFF_SECONDS": "0"},
+            clear=False,
+        ), patch.object(common.litellm, "completion", side_effect=failure) as completion:
+            with self.assertRaises(common.LLMCallError) as raised:
+                common.llm_call(
+                    config,
+                    None,
+                    [{"role": "user", "content": "ping"}],
+                    operation="planner task selection",
+                )
+
+        self.assertEqual(completion.call_count, 2)
+        self.assertIn("planner task selection", str(raised.exception))
+        self.assertIn("Network is unreachable", str(raised.exception))
+
     def test_human_input_is_returned_and_stop_is_recognized(self):
         interaction = HumanInteraction(Console())
         with patch("builtins.input", return_value="/tmp/missing.txt"):

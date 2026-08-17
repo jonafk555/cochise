@@ -216,7 +216,8 @@ class Executor:
                     self.model,
                     self.api_key,
                     tools,
-                    history
+                    history,
+                    operation="executor next action",
                 )
                 self.logger.log_llm_call('executor_next_cmds', response_message, costs, duration, output=False)
                 
@@ -418,7 +419,12 @@ class Executor:
             history.append(msg)
             self.logger.log_append_to_history(msg, source='manual', output=False)
 
-            result, duration, costs = llm_call(self.model, self.api_key, history) 
+            result, duration, costs = llm_call(
+                self.model,
+                self.api_key,
+                history,
+                operation="executor summary",
+            )
             self.logger.log_llm_call('executor_no_summary', result, costs, duration, output=True)
 
             if result["content"] is None or result["content"] == '':

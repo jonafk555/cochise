@@ -25,6 +25,7 @@ from jinja2 import Template
 
 from cochise.common import (
     LLMFunctionMapping,
+    LLMCallError,
     is_tool_call,
     llm_call,
     llm_tool_call,
@@ -987,6 +988,8 @@ class RangeAssessmentCoordinator:
                     if self.qa_guidance
                     else {},
                 }
+            except LLMCallError:
+                raise
             except Exception as exc:
                 adapter_findings.append(_adapter_failure_finding(
                     assessment_id=assessment_id,
@@ -1181,6 +1184,7 @@ class AssessmentExecutor:
                 self.api_key,
                 tools,
                 history,
+                operation="host assessment",
             )
             self.logger.log_llm_call("assessment_host", response_message, costs, duration, output=False)
             history.append(message_to_json(response_message))
@@ -1322,7 +1326,12 @@ class AssessmentExecutor:
                 "role": "user",
                 "content": "Provide a concise summary of all host assessment findings and unknowns.",
             })
-            result, duration, costs = llm_call(self.model, self.api_key, history)
+            result, duration, costs = llm_call(
+                self.model,
+                self.api_key,
+                history,
+                operation="host assessment summary",
+            )
             self.logger.log_llm_call("assessment_host_summary", result, costs, duration, output=False)
             summary = result.get("content") or "The assessment did not produce a summary."
         elif summary is None:

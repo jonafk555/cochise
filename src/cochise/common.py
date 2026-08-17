@@ -3,10 +3,26 @@ import functools
 import inspect
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, get_type_hints
 
 import litellm
+
+
+class LLMCallError(RuntimeError):
+    """A provider failure that should stop the current run, not a tool retry."""
+
+    def __init__(self, operation: str, model: str, attempts: int, cause: Exception):
+        self.operation = operation
+        self.model = model
+        self.attempts = attempts
+        self.cause = cause
+        super().__init__(
+            f"LLM {operation} failed for {model} after {attempts} attempt(s): "
+            f"{type(cause).__name__}: {cause}. "
+            "Check network access, proxy settings, and the configured API endpoint."
+        )
 
 
 @dataclass(frozen=True)
@@ -406,12 +422,71 @@ def _completion_kwargs(model: str | LLMConfig, api_key: str | None) -> dict[str,
     return kwargs
 
 
+def _is_transient_llm_error(error: Exception) -> bool:
+    """Return whether a provider failure is worth one bounded retry."""
+
+    text = f"{type(error).__name__}: {error}".lower()
+    return any(
+        marker in text
+        for marker in (
+            "network is unreachable",
+            "connection refused",
+            "connection reset",
+            "connecterror",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "status code: 502",
+            "status code: 503",
+            "status code: 504",
+        )
+    )
+
+
+def _completion_with_retry(
+    completion_kwargs: dict[str, Any],
+    *,
+    operation: str,
+) -> Any:
+    """Call LiteLLM with bounded transient-error recovery and clear failures."""
+
+    try:
+        max_retries = max(0, int(os.getenv("LLM_MAX_RETRIES", "1")))
+    except ValueError:
+        max_retries = 1
+    try:
+        backoff_seconds = max(0.0, float(os.getenv("LLM_RETRY_BACKOFF_SECONDS", "1")))
+    except ValueError:
+        backoff_seconds = 1.0
+
+    timeout = os.getenv("LLM_TIMEOUT_SECONDS", "").strip()
+    if timeout and "timeout" not in completion_kwargs:
+        try:
+            completion_kwargs["timeout"] = float(timeout)
+        except ValueError:
+            raise ValueError("LLM_TIMEOUT_SECONDS must be a number") from None
+
+    model = str(completion_kwargs.get("model", "configured model"))
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            return litellm.completion(**completion_kwargs)
+        except Exception as exc:
+            if not _is_transient_llm_error(exc) or attempts > max_retries:
+                raise LLMCallError(operation, model, attempts, exc) from exc
+            delay = backoff_seconds * (2 ** (attempts - 1))
+            if delay:
+                time.sleep(delay)
+
+
 def llm_tool_call(
     model: str | LLMConfig,
     api_key: str | None,
     tools: LLMFunctionMapping,
     messages: list[dict[str, Any]],
     tool_choice: dict[str, Any] | str | None = None,
+    operation: str = "tool call",
 ):
 
     tik = datetime.datetime.now()
@@ -422,7 +497,7 @@ def llm_tool_call(
     }
     if tool_choice is not None:
         completion_kwargs["tool_choice"] = tool_choice
-    response = litellm.completion(**completion_kwargs)
+    response = _completion_with_retry(completion_kwargs, operation=operation)
     tok = datetime.datetime.now()
 
     if len(response.choices) != 1:
@@ -465,6 +540,7 @@ def check_llm_tool_calling(
             "type": "function",
             "function": {"name": "_llm_healthcheck_tool"},
         },
+        operation="LLM healthcheck",
     )
     if not is_tool_call(response_message):
         raise RuntimeError(
@@ -503,13 +579,17 @@ def llm_call(
     model: str | LLMConfig,
     api_key: str | None,
     messages: list[dict[str, Any]],
+    operation: str = "completion",
 ):
     """make a simple LLM call without any response format parsing"""
 
     tik = datetime.datetime.now()
-    response = litellm.completion(
-        messages=messages,
-        **_completion_kwargs(model, api_key),
+    response = _completion_with_retry(
+        {
+            "messages": messages,
+            **_completion_kwargs(model, api_key),
+        },
+        operation=operation,
     )
     tok = datetime.datetime.now()
 

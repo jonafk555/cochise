@@ -7,6 +7,7 @@ from rich.pretty import Pretty
 
 from cochise.common import (
     LLMFunctionMapping,
+    LLMCallError,
     is_tool_call,
     llm_call,
     llm_tool_call,
@@ -115,7 +116,12 @@ class Planner:
         ]
         self.logger.log_append_to_history(tmp_history, "manual", False)
 
-        result, duration, costs = llm_call(self.model, self.model_api_key, tmp_history)
+        result, duration, costs = llm_call(
+            self.model,
+            self.model_api_key,
+            tmp_history,
+            operation="planner initial plan",
+        )
 
         plan = result["content"]
         self.logger.log_llm_call('planner_initial_plan', result=plan, costs=costs, duration=duration)
@@ -128,7 +134,12 @@ class Planner:
         self.history.append(msg)
         self.logger.log_append_to_history(msg, "manual", False)
 
-        result, duration, costs = llm_call(self.model, self.model_api_key, self.history)
+        result, duration, costs = llm_call(
+            self.model,
+            self.model_api_key,
+            self.history,
+            operation="planner history compaction",
+        )
 
         plan = result["content"]
         self.logger.log_llm_call('compact_history', plan, costs, duration, output=True)
@@ -274,6 +285,8 @@ class Planner:
             try:
                 function_to_call = tool_mapping.get_function(function_name)
                 raw_result = await function_to_call(**args)
+            except LLMCallError:
+                raise
             except Exception as e:
                 errors += 1
                 error = (f"Error calling {function_name} with arguments {args}: {e}. "
@@ -393,6 +406,7 @@ class Planner:
                     tool_mapping,
                     self.history,
                     tool_choice=self._planner_tool_choice(),
+                    operation="planner task selection",
                 )
             self.logger.console.log("LLM call completed, processing response...")
             self.logger.console.log(

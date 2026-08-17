@@ -16,7 +16,7 @@ from cochise.assessment import (
     load_victim_adapter,
     load_range_spec,
 )
-from cochise.common import check_llm_tool_calling, get_llm_config_from_env
+from cochise.common import LLMCallError, check_llm_tool_calling, get_llm_config_from_env
 from cochise.executor import ExecutorFactory
 from cochise.human_interaction import HumanInteraction
 from cochise.planner import Planner
@@ -204,7 +204,11 @@ async def async_main(argv: list[str] | None = None) -> None:
         qa_report.finalize("completed")
 
 def main() -> None:
-    asyncio.run(async_main())
+    try:
+        asyncio.run(async_main())
+    except LLMCallError as exc:
+        print(f"LLM provider unavailable: {exc}")
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
