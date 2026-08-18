@@ -1,365 +1,773 @@
-# Cochise: Autonomous LLM-Driven Pen-Testing in ~576 Lines of Python
+# Cochise-based LLM Cyber Range QA and Penetration-Testing Agent
 
-[![arXiv Paper](https://img.shields.io/badge/cs.SE-%20arXiv:2502.04227%20(Main%20Paper)-B31B1B.svg)](https://arxiv.org/abs/2502.04227)
-[![arXiv RCR](https://img.shields.io/badge/cs.SE-%20arXiv:2603.01789%20(RCR)-B31B1B.svg)](https://arxiv.org/abs/2603.01789)
+> **Origin:** This repository started from the upstream
+> [Cochise research prototype](https://github.com/andreashappe/cochise) by
+> Andreas Happe. It keeps the original Planner/Executor and tool-calling core,
+> and extends it with Cyber Range assessment, semantic QA guidance, victim-side
+> adapters, live QA reporting, and artifact aggregation.
+>
+> **起源：** 本專案一開始源自 Andreas Happe 的 upstream Cochise 研究原型；
+> 目前 fork 保留原本的 Planner/Executor 與 tool-calling 核心，再擴充
+> Cyber Range QA、語意化 spec、victim adapter、即時報告與 artifact 彙整。
 
-> Full Active Directory domain compromise. Under $2. Less than 2 hours. No human in the loop. How?
+This project uses an LLM to plan and execute authorized penetration-testing
+work in an isolated Cyber Range. The LLM decides how to interpret the scenario,
+select the next task, call tools, and evaluate evidence. Python provides the
+fixed infrastructure: SSH, tool schemas, state management, assessment gates,
+report rendering, artifact indexing, and bounded retries.
 
-Cochise is a minimal, readable prototype that uses LLMs to autonomously pen-test enterprise networks using Microsoft Active Directory. Point it at a testbed, pick an LLM, and watch it plan attack chains, execute commands, harvest credentials, and escalate to domain admin.
+Use this software only against systems that you own or are explicitly authorized
+to test. Never point it at production, public infrastructure, or a third-party
+network without written permission.
 
-So basically, I use LLMs to hack Microsoft Active Directory networks.. what could possibly go wrong?
+> **中文摘要：** 本專案是以 LLM 操作授權 Cyber Range 的 agent。LLM 負責
+> 語意決策與工具選擇，Python 負責 SSH、狀態、QA gate、報告及安全邊界。
 
-![AS-REP Roasting into Domain Enumeration](docs/asrep_into_enumeration.png)
+## What this repository currently implements
 
-**Why does this exist?** There are many autonomous hacking agent prototypes out there, but no good *baseline*. Cochise is deliberately minimal so you can:
+- A persistent LLM **Planner** and a short-lived **Executor** created for each
+  Planner round.
+- SSH command execution on a Linux attacker/Kali VM.
+- LiteLLM provider mapping for OpenAI, Anthropic/Claude, Gemini, Ollama, and
+  OpenAI-compatible local servers.
+- A mandatory global Cyber Range preflight before the Planner starts ordinary
+  attack work.
+- Black-box assessment by default, with optional white-box assessment through
+  `RANGE_SPEC_PATH`.
+- Human-authored QA intent through `--qa-instructions`; the input can be
+  Markdown, YAML, JSON, plain text, or natural language. The file is kept as
+  semantic context and is never executed as a script.
+- Per-host QA gates. A host declared by a structured white-box spec, or a host
+  confirmed by `register_host_access`, is assessed before the next ordinary
+  attack task.
+- LLM-selected logical QA roles: common host QA, Windows endpoint QA,
+  Windows AD QA, Linux Cyber Range QA, attack validation, victim validation,
+  and evidence synthesis.
+- Optional control-plane and victim-side adapters using explicit
+  `module:factory` references.
+- A continuously updated Markdown QA report with white-box expectation
+  coverage/conformance.
+- A single content-hash-deduplicated `artifact-manifest.jsonl` instead of one
+  artifact file for every command result.
+- JSON trajectory logging, replay, token analysis, duration analysis, and graph
+  generation.
 
-- **Build on it**: fork it and add your ideas without fighting framework complexity. We provide analysis scripts for later analysis of log files too.
-- **Benchmark LLMs**: swap models via a single env var and compare cybersecurity capabilities
-- **Understand it**: the entire agent core fits in ~576 lines of readable Python. This makes it also well-suited as a base for vibe-coding sessions.. LLMs can easily understand it too.
+The repository does **not** include native WinRM, PowerShell Remoting, Windows
+AD management, or Linux victim-agent transports. Configure
+`RANGE_VICTIM_MODULE` when victim-side execution is required. Without that
+adapter, QA evidence is attacker-side evidence collected from Kali.
 
-## Key Results
-
-I am using [GOAD](https://github.com/Orange-Cyberdefense/GOAD) (Game of Active Directory) as a testbed. This is a vulnerable Microsoft Windows Active Directory network, consisting of 3 domains with 5 servers, emulated users, and lots of vulnerabilities. When testing `cochise`, I had the following results (full evaluation to follow):
-
-- `claude-4.6-opus` was able to fully-compromise (as in `domain dominance`) all three domains within 90 minutes.
-- `gemini-3-flash-preview` is typically able to compromise 1-2 domains per run at much lower costs (typically ~$2 per run)
-- `gpt-5.4` creates very long convoluted answers, need to fix context management within the *Executor* component for this. Was able to compromise 1-2 domains before my prototype crashed.
-- `deepseek-v3.2` was the best open-weight model that I tested and was able to sometimes compromise a single domain but with very neglectable costs.
-
-I also run some of the newer Chinese models (`glm-5-turbo`, `mimi-v2-pro`, `minimax-m2.7`). While they were worse than `deepseek-v3.2` their quality was very similar to the frontier models that I've tested in early/mid 2025, their progress is impressive.
+> **中文摘要：** 目前已實作 Planner/Executor、black-box/white-box QA、每台
+> 主機 gate、Windows/Linux 語意評估、victim/control-plane adapter、即時 QA
+> report 與 artifact 去重；Windows/Linux victim transport 需要自行提供 adapter。
 
 ## Architecture
 
+```text
+                         .env / CLI
+                              |
+                              v
+                    +---------------------+
+                    | cochise CLI         |
+                    | LLMConfig + SSH     |
+                    +----------+----------+
+                               |
+                 global range preflight / QA report
+                               |
+        +----------------------+----------------------+
+        |                                             |
+        v                                             v
++------------------+   perform_task   +------------------------+
+| Planner (persist) | ----------------> | Executor (ephemeral) |
+| plan, knowledge   |                  | command/tool loop     |
++--------+---------+                  +-----------+------------+
+         |                                        |
+         | register_host_access                   | SSH execute_command
+         v                                        v
++---------------------------+          +-----------------------+
+| Host QA / Assessment      |          | attacker / Kali VM    |
+| LLM worker + gate         |          | nmap, shell, tooling  |
++-------------+-------------+          +-----------------------+
+              |
+       optional victim/control-plane adapters
+              |
+              v
+      +----------------------+      +--------------------------+
+      | QAReportWriter       |      | ArtifactRegistry          |
+      | logs/qa-report.md    |      | artifacts/manifest.jsonl |
+      +----------------------+      +--------------------------+
 ```
-                    +------------------+
-                    |     Planner      |  Strategic brain: creates attack plan,
-                    |   (persistent)   |  selects tasks, aggregates knowledge
-                    +--------+---------+
-                             |
-                    delegates tasks via LLM tool-calling
-                             |
-                    +--------v---------+
-                    |     Executor     |  Tactical: fresh instance per task,
-                    |   (ephemeral)    |  runs commands, reports findings
-                    +--------+---------+
-                             |
-                      SSH execute_command via LLM tool-calling
-                             |
-                    +--------v---------+
-                    |  Kali Linux VM   |  Attacker machine inside the
-                    |  (target network)|  target network
-                    +------------------+
-```
 
-The **Planner** maintains a persistent conversation with the LLM, building and updating a hierarchical attack plan. It delegates individual tasks to short-lived **Executor** instances that run shell commands over SSH and report back. A shared **Knowledge Base** tracks compromised accounts, discovered services, and attack leads across rounds.
+### Planner and Executor
 
-Context window management is built-in: when the planner's history grows too large, it's automatically compacted so runs can continue for hours.
+The Planner keeps the strategic conversation, a tree-shaped task plan, and the
+shared `Knowledge` store. Each Planner round builds a fresh Executor. The
+Executor has no previous round's conversation, but receives the current
+knowledge snapshot and the current scenario.
 
-## Quick Start
+The Planner normally asks the LLM to call exactly one `perform_task` tool. The
+Executor then selects and executes the commands needed for that task. Multiple
+tool calls emitted in one Executor response are run concurrently with
+`asyncio`.
 
-### Prerequisites
+The Executor returns a summary and local knowledge. The Planner merges dirty
+accounts, entities, hosts, privileges, shell sessions, and findings into the
+shared store. When the Planner context reaches a configured limit, the LLM
+compacts the history into a new plan and a bounded knowledge context.
 
-- Python 3.12+
-- A target environment/testbed (I am using [GOAD](https://github.com/Orange-Cyberdefense/GOAD))
-- SSH access to a Linux attacker VM (e.g., Kali) inside the testbed
-- Access to an LLM API, or a local tool-calling LLM server (Ollama, LM Studio, vLLM, etc.)
+### Assessment and gates
 
-### Install
+`RangeAssessmentCoordinator` runs beside the original Planner/Executor flow; it
+does not replace the attack executor:
+
+1. A global preflight runs from the attacker VM before the initial Planner plan.
+2. Structured hosts in a white-box spec can be registered as pending QA hosts.
+3. The Executor calls `register_host_access` after confirming access to a new
+   host.
+4. Before the next ordinary attack task, the Planner runs the pending host QA.
+5. Blocking findings request human guidance. With `HUMAN_INTERACTION=0`, the
+   finding is retained and an explicit automatic override is recorded; the
+   range is not automatically repaired.
+
+A network address discovered by a global scan is not automatically converted
+into a host QA gate. It must be declared in a structured spec or confirmed by
+the LLM workflow through `register_host_access`.
+
+> **中文摘要：** QA assessment 是原本攻擊流程旁邊的 gate，不取代 Planner/
+> Executor。global discovery 後，新主機要先完成 host QA 才能繼續一般攻擊。
+
+## Run lifecycle
+
+1. The CLI loads `.env` from the project directory. It uses
+   `load_dotenv(override=True)`, so values in `.env` override inherited shell
+   variables.
+2. It resolves the LLM configuration, optionally runs the tool-calling
+   healthcheck, connects to SSH, and initializes the QA report and adapters.
+3. The global black-box or white-box preflight collects initial range evidence.
+4. The Planner creates an initial plan and starts selecting executable tasks.
+5. The Executor runs SSH tools, records findings, and returns knowledge.
+6. Newly accessed hosts are assessed before the Planner selects another normal
+   attack task. Victim-side evidence is kept separate when a victim adapter is
+   configured.
+7. The report is finalized as `completed` or `failed` when the run ends.
+
+## Installation
+
+### Requirements
+
+- Python 3.12 or newer.
+- [uv](https://docs.astral.sh/uv/).
+- An authorized, isolated Cyber Range or test network.
+- A Linux attacker/Kali VM reachable through SSH. `TARGET_HOST` is this attacker
+  VM, not automatically an AD domain controller or victim endpoint.
+- An LLM API or local model server that supports chat tool/function calling.
+- `nmap` on Kali when `RANGE_NETWORKS` is configured; the basic preflight also
+  uses `ip` and `/etc/resolv.conf`.
+
+### Install the repository
 
 ```bash
-git clone https://github.com/andreashappe/cochise.git
+git clone https://github.com/jonafk555/cochise.git
 cd cochise
+uv sync
+uv run cochise --help
 ```
 
-### Configure
+The current SSH implementation uses password authentication, port 22, and
+`known_hosts=None` in AsyncSSH. Use it only inside the authorized test range.
 
-Create a `.env` file:
+> **中文摘要：** 需要 Python 3.12、uv、可 SSH 連線的 Kali attacker VM、支援
+> tool calling 的 LLM，以及隔離且已授權的測試環境。
 
-```bash
-# LLM configuration
-# Choose one provider: openai, claude, gemini, or local.
-LLM_PROVIDER='openai'
-LLM_MODEL='gpt-4o'
-OPENAI_API_KEY='sk-...'
+## Environment configuration
 
-# SSH connection to your attacker VM
-TARGET_HOST='192.168.56.100'
-TARGET_USERNAME='root'
-TARGET_PASSWORD='kali'
+Create `.env` in the repository root. Do not commit it. API keys, SSH
+credentials, and run logs should all be treated as sensitive.
 
-# Optional: runtime limits
-MAX_RUN_TIME=7200                  # stop after N seconds (0 = unlimited)
-PLANNER_MAX_CONTEXT_SIZE=250000    # compact history at N tokens
-PLANNER_MAX_INTERACTIONS=0         # max planner rounds (0 = unlimited) before history compaction
-PLANNER_HARD_MAX_INTERACTIONS=100  # safety cap for planner rounds (0 = unlimited)
+### Minimal working configuration
 
-# Cyber Range assessment
-RANGE_MODE='blackbox'              # blackbox or whitebox
-RANGE_SPEC_PATH=''                 # YAML/JSON/Markdown/text spec for whitebox mode
-RANGE_NETWORKS='192.168.122.0/24' # optional comma-separated scan targets
-RANGE_CONTROL_PLANE_MODULE=''      # optional local module:factory adapter
-RANGE_VICTIM_MODULE=''              # optional victim-side module:factory adapter
-QA_REPORT_PATH='logs/qa-report.md' # continuously updated Markdown QA report
-QA_ARTIFACT_DIR=''                  # optional single directory for deduplicated artifact index
-LLM_HEALTHCHECK=1                  # verify tool calling before preflight
-HUMAN_INTERACTION=1                # set to 0 to disable prompts; continue autonomously
-# Optional for OpenAI GPT-5.4+ tool calls: none (default), low, medium, high, ...
-LLM_REASONING_EFFORT='none'
+```dotenv
+# Cloud LLM: openai / claude / gemini
+LLM_PROVIDER=openai
+LLM_MODEL=gpt-4o
+OPENAI_API_KEY=sk-...
+
+# SSH to the attacker/Kali VM, not the AD/victim host
+TARGET_HOST=192.168.56.100
+TARGET_USERNAME=root
+TARGET_PASSWORD=kali
+
+# Explicit black-box mode
+RANGE_MODE=blackbox
+RANGE_NETWORKS=192.168.56.0/24
+
+# Optional behavior
+LLM_HEALTHCHECK=1
+HUMAN_INTERACTION=1
 ```
 
-Cochise uses LiteLLM underneath, so the planner and executor use the same
-provider connection and tool-calling interface. The supported provider
-configurations are:
+### LLM provider examples
 
-```bash
+```dotenv
 # OpenAI
-LLM_PROVIDER='openai'
-LLM_MODEL='gpt-4o'
-OPENAI_API_KEY='sk-...'
+LLM_PROVIDER=openai
+LLM_MODEL=gpt-4o
+OPENAI_API_KEY=sk-...
 
-# Claude / Anthropic
-LLM_PROVIDER='claude'
-LLM_MODEL='claude-sonnet-4-5'
-ANTHROPIC_API_KEY='sk-ant-...'
+# Anthropic / Claude
+LLM_PROVIDER=claude
+LLM_MODEL=claude-sonnet-4-5
+ANTHROPIC_API_KEY=sk-ant-...
 
 # Gemini
-LLM_PROVIDER='gemini'
-LLM_MODEL='gemini-2.5-flash'
-GEMINI_API_KEY='...'
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-2.5-flash
+GEMINI_API_KEY=...
 
-# Local Ollama (no API key required)
-LLM_PROVIDER='local'
-LOCAL_LLM_BACKEND='ollama'
-LLM_MODEL='llama3.1'
-LOCAL_LLM_BASE_URL='http://127.0.0.1:11434'
+# Ollama
+LLM_PROVIDER=local
+LOCAL_LLM_BACKEND=ollama
+LLM_MODEL=llama3.1
+LOCAL_LLM_BASE_URL=http://127.0.0.1:11434
 
-# Local OpenAI-compatible server, e.g. LM Studio, vLLM, or llama.cpp
-LLM_PROVIDER='local'
-LOCAL_LLM_BACKEND='openai-compatible'
-LLM_MODEL='your-loaded-model-name'
-LOCAL_LLM_BASE_URL='http://127.0.0.1:1234/v1'
-LOCAL_LLM_API_KEY='local'
+# LM Studio / vLLM / llama.cpp and other OpenAI-compatible servers
+LLM_PROVIDER=local
+LOCAL_LLM_BACKEND=openai-compatible
+LLM_MODEL=your-loaded-model
+LOCAL_LLM_BASE_URL=http://127.0.0.1:1234/v1
+LOCAL_LLM_API_KEY=local
 ```
 
-`LLM_BASE_URL` and `LLM_API_KEY` can be used as provider-neutral overrides.
-For backwards compatibility, `LITELLM_MODEL` and `LITELLM_API_KEY` still work
-with fully-qualified LiteLLM model names such as
-`openrouter/google/gemini-3-flash-preview`. Local models must support chat
-tool/function calling because Cochise delegates SSH and knowledge-base actions
-through tools.
+`LLM_API_KEY` and `LLM_BASE_URL` are provider-neutral overrides. For backward
+compatibility, a fully qualified LiteLLM model can still be configured without
+`LLM_PROVIDER`:
 
-For OpenAI GPT-5.4+ deployments, Cochise sends tool calls with
-`reasoning_effort=none` by default. This avoids the endpoint error that occurs
-when function tools are combined with a non-`none` reasoning effort. Choose
-another supported value only when the configured endpoint supports that
-combination (typically through its Responses API).
-
-### Cyber Range QA
-
-QA is part of the normal `cochise` run rather than a separate command. It is
-intended for an authorized, isolated Cyber Range only. The Planner and ordinary
-Executor remain LLM-driven; Python supplies the SSH, adapter, state, gate, and
-reporting infrastructure.
-
-| Mode | Configuration | Behavior |
-|---|---|---|
-| Black-box (default) | `RANGE_MODE=blackbox` | Collects observations from the attacker VM without requiring range metadata. |
-| White-box | `RANGE_MODE=whitebox` and `RANGE_SPEC_PATH=...` | Adds a YAML, JSON, Markdown, plain-text, or natural-language environment document. The LLM interprets the raw content and creates a versioned semantic expectation manifest. |
-
-`TARGET_HOST` is the SSH attacker/Kali host, not automatically an AD or victim
-host. `RANGE_NETWORKS` controls the optional black-box network probes. The
-scenario objective and target range are still defined by
-`src/cochise/templates/scenario.md`.
-
-The global preflight runs before the Planner selects ordinary attack work. Each
-host declared by a structured white-box spec, or each host for which the attack
-workflow calls `register_host_access`, becomes a pending Host QA gate. The gate
-runs before the next ordinary attack task. A network address found by a global
-scan is not automatically converted into a Host QA record; it must be declared
-or confirmed by the LLM workflow.
-
-Every Host QA worker uses the common baseline and semantically selects the
-applicable checks:
-
-- Windows endpoint: workstation or server, domain-joined or standalone;
-- Windows AD: only when evidence supports a domain-controller/AD role;
-- Linux Cyber Range: AD-integrated or standalone;
-- attack-feasibility, privilege, reverse-shell, and evidence validation.
-
-The worker records `pass`, `fail`, `unknown`, `not_applicable`, or
-`blocked_by_access`. It attempts a reasonable authorized privilege-escalation
-path first, records the identity and privilege before/after the attempt, and
-does not invent privileged observations.
-
-Blocking findings pause for human guidance when `HUMAN_INTERACTION=1`. With
-`HUMAN_INTERACTION=0`, the run continues autonomously and records an explicit
-override; Cochise does not automatically repair the range.
-
-Optional management-plane evidence can be added with
-`RANGE_CONTROL_PLANE_MODULE=module:factory`. The factory must return an object
-implementing:
-
-```python
-async def collect_global(spec): ...
-async def collect_host(host_id, host, spec): ...
+```dotenv
+LITELLM_MODEL=openrouter/google/gemini-3-flash-preview
+LITELLM_API_KEY=sk-or-...
+LITELLM_API_BASE=https://openrouter.ai/api/v1
 ```
 
-Optional victim-side QA can be added with
-`RANGE_VICTIM_MODULE=module:factory`. The factory must return an object with:
+When `LLM_PROVIDER` is set, `LLM_MODEL` takes precedence over the provider-
+specific model aliases. API keys are resolved from the general variable,
+provider-specific variables, and then the legacy LiteLLM variable. Cloud
+providers require an API key. Local Ollama does not. A local OpenAI-compatible
+backend uses `local` as its default LiteLLM key when none is supplied.
 
-```python
-async def execute_victim_command(
-    host_id, command, purpose="", shell_id=""
-): ...
+### Complete `.env` reference
+
+#### Required connection variables
+
+| Variable | Required | Description |
+|---|---:|---|
+| `TARGET_HOST` | yes | SSH address of the attacker/Kali VM. |
+| `TARGET_USERNAME` | yes | SSH username. |
+| `TARGET_PASSWORD` | yes | SSH password. |
+
+#### LLM and request controls
+
+| Variable | Default | Description |
+|---|---:|---|
+| `LLM_PROVIDER` | unset | `openai`, `claude`/`anthropic`, `gemini`/`google`, or `local`. |
+| `LLM_MODEL` | unset | Model name. Provider aliases: `OPENAI_MODEL`, `ANTHROPIC_MODEL`/`CLAUDE_MODEL`, `GEMINI_MODEL`/`GOOGLE_MODEL`, `LOCAL_LLM_MODEL`/`OLLAMA_MODEL`. |
+| `LLM_API_KEY` | unset | General API key; provider and legacy fallbacks are supported. |
+| `LLM_BASE_URL` | unset | General endpoint; provider-specific base fallbacks are supported. |
+| `LOCAL_LLM_BACKEND` | `ollama` | `ollama` or `openai-compatible`. |
+| `LOCAL_LLM_BASE_URL` | backend-dependent | Ollama defaults to `http://127.0.0.1:11434`; OpenAI-compatible defaults to `http://127.0.0.1:1234/v1`. |
+| `LOCAL_LLM_API_KEY` | unset | Local key; `OLLAMA_API_KEY` is also accepted. |
+| `LLM_REASONING_EFFORT` | `none` for GPT-5.4+ tool calls | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `default`. |
+| `LLM_MAX_RETRIES` | `1` | Maximum retries for transient provider/network errors. |
+| `LLM_RETRY_BACKOFF_SECONDS` | `1` | Exponential backoff base in seconds. |
+| `LLM_TIMEOUT_SECONDS` | unset | LiteLLM request timeout; it does not change the SSH command timeout. |
+
+#### Planner, interaction, and QA controls
+
+| Variable | Default | Description |
+|---|---:|---|
+| `MAX_RUN_TIME` | `7200` | Planner runtime in seconds; `0` means unlimited. |
+| `PLANNER_MAX_CONTEXT_SIZE` | `250000` | Planner prompt-token threshold for history compaction; `0` disables this trigger. |
+| `PLANNER_MAX_INTERACTIONS` | `0` | Planner-round threshold for compaction; `0` disables this trigger. |
+| `PLANNER_HARD_MAX_INTERACTIONS` | `100` | Hard Planner interaction cap; `0` means unlimited. |
+| `LLM_HEALTHCHECK` | `1` | Force a tool-calling check before the range preflight. |
+| `HUMAN_INTERACTION` | `1` | `1` enables `ask_human`; `0` disables stdin and records automatic gate overrides. |
+| `RANGE_MODE` | white-box when a spec exists, otherwise black-box | Must be `blackbox` or `whitebox`. |
+| `RANGE_SPEC_PATH` | unset | White-box spec path; required when `RANGE_MODE=whitebox`. |
+| `RANGE_NETWORKS` | unset | Attacker-side probe CIDRs, separated by commas or semicolons. |
+| `RANGE_CONTROL_PLANE_MODULE` | unset | Management/control-plane adapter in `module:factory` form. |
+| `RANGE_VICTIM_MODULE` | unset | Victim command/session adapter in `module:factory` form. |
+| `QA_REPORT_PATH` | `logs/qa-report.md` | Continuously updated Markdown QA report. |
+| `QA_ARTIFACT_DIR` | `<report directory>/artifacts` | Directory containing `artifact-manifest.jsonl`. |
+
+Because `.env` is loaded with `override=True`, a value in `.env` wins over an
+inherited shell value. If `.env` contains `RANGE_MODE=blackbox`, running
+`RANGE_MODE=whitebox uv run cochise` may still result in black-box mode. Edit
+`.env` or remove the conflicting variable when switching modes.
+
+> **中文摘要：** `.env` 是目前執行設定的權威來源，會覆寫 shell 環境變數；
+> `TARGET_HOST` 是 Kali，不是 AD 或 victim。所有 LLM、Planner、QA、report
+> 與 adapter 參數均列於上表。
+
+## Command-line usage
+
+### Main run
+
+```text
+uv run cochise [--qa-instructions PATH]
+               [--qa-file PATH]
+               [--qa-guidance PATH]
+               [--human-qa PATH]
 ```
 
-It may also implement `execute_shell_command(shell_id, command, purpose="")`
-for persistent victim sessions. The adapter owns WinRM, PowerShell Remoting,
-Linux SSH/agent, AD management, and session transport; Cochise only routes the
-LLM request and records attacker/victim provenance. Without this adapter, QA is
-attacker-side only. A reverse shell should be registered with a stable
-`shell_id`, host, identity, privilege, working directory, and transport. The
-core records and passes that ID to the LLM, while persistent shell transport
-remains adapter-owned.
-
-### Run
-
-Before you run it, check `src/cochise/templates/scenario.md`. This file contains generic instructions
-for the LLM ('attack the AD network'). It also contains the target IP range (hardcoded to the default
-192.168.122.0/24 IP range of GOAD when running using libvirt/KVM). Change this to fit your lab setup.
+The four option names are aliases for the same destination; use one of them for
+clarity. The file is read as UTF-8. Markdown, YAML, JSON, plain text,
+and natural language are accepted as raw semantic input. Python records the
+source, format label, character count, and SHA-256; the QA LLM decides which
+checks apply.
 
 ```bash
+uv run cochise --help
 uv run cochise
-```
-
-An authorized human QA engineer can add natural-language, threat-informed QA
-guidance without changing the range spec:
-
-```bash
 uv run cochise --qa-instructions specs/human-qa.md
 ```
 
-The file is passed to the QA LLM as semantic intent. It can use free-form
-Markdown or plain text and is never executed as a script. The run records its
-path, format, character count, and SHA-256 in the QA report metadata.
+`RANGE_SPEC_PATH` is not a positional argument. To combine a white-box spec
+with human QA guidance, set the spec in `.env` and pass the guidance file:
 
-To use a white-box spec and human QA guidance together:
-
-```bash
-RANGE_MODE=whitebox \
-RANGE_SPEC_PATH=specs/range.md \
-uv run cochise --qa-instructions specs/human-qa.md
+```dotenv
+RANGE_MODE=whitebox
+RANGE_SPEC_PATH=specs/environment.md
 ```
 
-The human guidance file is an additional semantic QA objective; it does not
-replace `RANGE_SPEC_PATH` and is never executed as a script. The LLM decides
-which checks apply and must support each conclusion with observed evidence.
+```bash
+uv run cochise --qa-instructions specs/threat-informed-qa.md
+```
 
-The report can be watched while the run is active:
+### Run output and analysis tools
+
+```text
+uv run cochise-replay INPUT
+
+uv run cochise-analyze-logs ANALYSIS INPUT [INPUT ...]
+                            [--latex]
+                            [--duration-min SECONDS]
+                            [--model-eq MODEL_LIST]
+                            [--model-substr TEXT]
+
+uv run cochise-analyze-graphs ANALYSIS INPUT [INPUT ...]
+```
+
+`cochise-analyze-logs` accepts:
+
+- `index-rounds`
+- `index-rounds-and-tokens`
+- `show-tokens`
+- `index-tokens-and-accounts`
+
+`cochise-analyze-graphs` accepts:
+
+- `planner_input_size`
+- `llm_duration_vs_tokens`
+- `executor_input_size`
+- `executor_cache_size`
+
+Examples:
+
+```bash
+uv run cochise-replay logs/run-20260402-095548.json
+uv run cochise-analyze-logs index-rounds-and-tokens logs/run-*.json
+uv run cochise-analyze-graphs planner_input_size logs/run-*.json
+```
+
+The analysis utilities consume the raw JSON trajectory. Graphs write PDF files
+to the current working directory. Replay primarily renders the original
+Planner/Executor event subset; the complete QA result is in `QA_REPORT_PATH`
+and the raw JSON trajectory.
+
+## Scenario, environment spec, and human QA guidance
+
+These inputs have different responsibilities:
+
+| Input | Location | Responsibility |
+|---|---|---|
+| **Scenario** | `src/cochise/templates/scenario.md` | System context for Planner, Executor, and Assessment workers. It defines the attack objective, rules, range assumptions, and tool guidance. |
+| **Environment spec** | `RANGE_SPEC_PATH` | White-box environment context and semantic expectations. It does not directly rewrite the attack objective and is never executed as code. |
+| **Human QA guidance** | `--qa-instructions PATH` | Additional QA intent from a human engineer. It does not replace the scenario or the environment spec. |
+
+The checked-in `scenario.md` is still AD-oriented: its current objective and
+rules describe a Microsoft Active Directory assessment, including default range
+assumptions. If only the QA guidance or environment spec changes, the Planner
+still sees that AD scenario. To change the ordinary attack objective, edit
+`src/cochise/templates/scenario.md` or add a separate scenario-selection
+mechanism in a future extension.
+
+> **中文摘要：** `scenario.md` 才是 Planner/Executor 的主要 system context，
+> 目前仍以 AD 為主；Range Spec 與 `--qa-instructions` 只補充 QA 語意，不會
+> 自動改變一般攻擊目標。
+
+### White-box spec formats
+
+`RANGE_SPEC_PATH` supports:
+
+- `.yaml`/`.yml`: opportunistic mapping parsing while preserving the raw text;
+- `.json`: opportunistic mapping parsing; malformed JSON is preserved as text;
+- `.md`, plain text, and other extensions: raw semantic content, with a
+  best-effort YAML mapping parse when possible.
+
+`src/cochise/templates/range_spec.schema.json` is a permissive field hint, not
+a required validator. A spec may use fixed fields, mixed formats, or natural
+language. The LLM extracts explicit expectations, marks inferred assumptions,
+and updates a versioned semantic expectation manifest with observed evidence.
+
+Structured example:
+
+```yaml
+scenario_ref: isolated-mail-lab
+networks:
+  - 192.168.0.0/24
+  - 192.168.100.0/24
+hosts:
+  - id: dc01
+    hostname: dc01
+    ip: 192.168.0.10
+    role: Windows AD domain controller
+  - id: machine-a
+    ip: 192.168.0.20
+    role: Windows endpoint, domain joined
+  - id: machine-b
+    ip: 192.168.0.21
+    role: standalone Windows endpoint
+  - id: linux-range
+    ip: 192.168.100.10
+    role: standalone Linux Cyber Range host
+```
+
+Markdown or natural language can describe the same topology, including an
+attacker mail server, mail gateway, domain-joined or standalone endpoints,
+expected reverse-shell behavior, and required evidence. The LLM maps the
+description to expectations; it does not treat the document as a command list.
+
+## Cyber Range QA
+
+### Black-box mode (default)
+
+Without a white-box spec, the global adapter runs these commands from Kali:
+
+- `ip -brief address`
+- `ip route`
+- `cat /etc/resolv.conf`
+- `nmap -sn -n -T3 <network>` for every configured `RANGE_NETWORKS` CIDR
+
+For a structured host with an IP, host collection uses
+`nmap -Pn -n -sT --top-ports 100 <address>`. Without host metadata, host QA
+starts only after the attack workflow confirms access through
+`register_host_access`.
+
+### White-box mode
+
+`RANGE_MODE=whitebox` requires `RANGE_SPEC_PATH`. The LLM receives a bounded
+semantic context containing the raw spec, source, format, and SHA-256. It
+extracts explicit expectations, marks assumptions, and verifies them using
+attacker, control-plane, or victim evidence. Incomplete specs do not disable
+discovery; unobservable properties remain `unknown`.
+
+### Host QA coverage
+
+Each host worker first performs a common observable baseline. The LLM then
+selects applicable platform checks from evidence:
+
+- **Windows endpoint:** workstation/server, domain membership, build, users and
+  groups, services, firewall, Defender/EDR, SMB/WinRM/RDP, PowerShell, UAC,
+  scheduled tasks, and local ACLs.
+- **Windows AD:** only when evidence supports a domain-controller/AD role;
+  domain/forest, DNS, Kerberos, LDAP/LDAPS, SMB, users/groups, SPNs, trusts,
+  GPO/ACLs, and attack-path feasibility.
+- **Linux Cyber Range:** AD-integrated or standalone distribution/kernel, users,
+  sudo, SSH/PAM, systemd/cron, listeners, firewall, SELinux/AppArmor,
+  SUID/capabilities, filesystem permissions, containers, web/database services,
+  and LDAP/Kerberos integration.
+
+The worker must not mark unobserved information as passing. If access is
+insufficient, it attempts a reasonable authorized privilege-escalation path
+first and records identity/privilege before and after. If escalation is not
+possible, it records `unknown` or `blocked_by_access` rather than guessing.
+
+### Attacker, victim, and reverse-shell evidence
+
+Attacker-side commands use the existing SSH `execute_command` tool. Victim-side
+commands are available only when `RANGE_VICTIM_MODULE` is configured through
+`execute_victim_command`. Persistent victim shells require an adapter that also
+implements `execute_shell_command`.
+
+When a reverse shell is established, register it immediately:
+
+```text
+register_shell_session(
+  shell_id="victim-a-rshell-1",
+  host_id="machine-a",
+  platform="windows",
+  identity="user-or-system",
+  privilege_level="user-or-admin",
+  cwd="C:\\Users\\...",
+  transport="reverse-shell"
+)
+```
+
+`shell_id` is the routing key for subsequent LLM actions. Use the same ID with
+`execute_shell_command`, and call `update_shell_session` whenever identity,
+privilege, working directory, or connection status changes. The QA report keeps
+attacker/victim source, host, shell ID, and evidence correlation visible. Never
+confuse the Kali SSH shell with a victim shell.
+
+> **中文摘要：** reverse shell 建立後必須註冊唯一 `shell_id`，後續用同一 ID
+> 路由。Kali attacker shell 與 victim shell 是不同執行上下文。
+
+## QA report and artifact aggregation
+
+`QAReportWriter` creates the report at startup and atomically rewrites it after
+global/host progress, completed assessments, expectation updates, and final
+run status changes.
 
 ```bash
 tail -f logs/qa-report.md
 ```
 
-Cochise creates a timestamped JSON trajectory in `logs/` containing LLM calls,
-tool calls, command results, and discovered credentials. The Markdown QA report
-is atomically refreshed after global discovery, each Host QA progress update,
-and each completed assessment. In white-box mode it includes the expectation
-manifest, coverage, and conformance. Large evidence is deduplicated by content
-hash into one `artifact-manifest.jsonl` under `QA_ARTIFACT_DIR`, or by default in
-`logs/artifacts/`; the raw trajectory remains authoritative.
+The report contains:
 
-### Human-in-the-loop
+- run status, timestamps, configuration metadata, and artifact index path;
+- global/host assessment index and current phase/round;
+- finding status, severity, confidence, expected value, and observed value;
+- attacker-side, victim-side, and control-plane evidence provenance;
+- white-box manifest version, expectation coverage, and conformance;
+- active shell IDs, privilege events, and aggregated artifact count.
 
-With `HUMAN_INTERACTION=1`, the agent can call `ask_human` when it is blocked or
-cannot find an expected file/artifact. If an Executor reaches its normal
-25-round limit without a result, Cochise pauses in the terminal and asks for
-guidance automatically. Enter a file path, copy instructions, credentials, or
-another next step. Enter `stop` to stop the current run. The response is added
-to the agent history and the Executor gets a short recovery window to continue.
+Large evidence is not duplicated in the Markdown report. `ArtifactRegistry`
+deduplicates content by SHA-256 and writes one `artifact-manifest.jsonl` in the
+configured directory. The original content remains in the run JSON trajectory
+or in the adapter-owned file referenced by `raw_reference`; the manifest is a
+compact index, not a complete evidence backup.
 
-For unattended execution, set `HUMAN_INTERACTION=0`. Cochise will not read
-stdin; programmatic blocking assessment gates are automatically recorded and
-overridden, while `ask_human` is removed from the LLM tool surface. Assessment
-and Executor workers stop after repeated rounds without executable progress.
-Use `HUMAN_INTERACTION=1` when a human must approve or reject a blocking finding.
+The report and artifact index redact common password, secret, token, API-key,
+and authorization patterns. The raw trajectory may still contain tool
+arguments, command output, and test credentials. Protect the entire `logs/`
+directory and do not put real secrets in scenario, spec, or guidance files.
 
-## Analysis Tools
+## Optional adapters
 
-Cochise ships with tools to replay, analyze, and visualize test runs:
+### Control-plane adapter
+
+Configure:
+
+```dotenv
+RANGE_CONTROL_PLANE_MODULE=my_range_adapters:control_plane
+```
+
+The factory receives no arguments and must return an object implementing:
+
+```python
+class ControlPlane:
+    async def collect_global(self, spec=None):
+        return {"evidence": []}
+
+    async def collect_host(self, host_id, host, spec=None):
+        return {"evidence": []}
+
+
+def control_plane():
+    return ControlPlane()
+```
+
+Evidence entries may contain `category`, `command`, `output`, `exit_status`,
+`source`, and `raw_reference`. Cochise merges control-plane evidence with the
+attacker view before passing it to the QA worker.
+
+### Victim-side adapter
+
+Configure:
+
+```dotenv
+RANGE_VICTIM_MODULE=my_range_adapters:victim
+```
+
+Minimal interface:
+
+```python
+class Victim:
+    async def execute_victim_command(
+        self, host_id, command, purpose="", shell_id=""
+    ):
+        # Implement WinRM, PowerShell Remoting, Linux SSH, an agent,
+        # or another authorized victim transport here.
+        return {"output": "...", "exit_status": 0}
+
+    async def execute_shell_command(self, shell_id, command, purpose=""):
+        return {"output": "...", "exit_status": 0, "shell_id": shell_id}
+
+
+def victim():
+    return Victim()
+```
+
+`execute_shell_command` is optional. Without it, Cochise can still issue bounded
+`execute_victim_command` requests, but cannot maintain a persistent reverse-shell
+transport. The adapter owns authentication, transport, session lifecycle, and
+victim-side safety boundaries. Cochise routes the LLM request and records
+provenance; it does not execute spec text directly.
+
+> **中文摘要：** Windows/Linux victim 的實際命令執行由使用者提供的 adapter
+> 負責；核心只做 bounded routing、session metadata 與 evidence provenance。
+
+## Token, performance, and stability boundaries
+
+- Planner history compacts at `PLANNER_MAX_CONTEXT_SIZE` or
+  `PLANNER_MAX_INTERACTIONS`; `PLANNER_HARD_MAX_INTERACTIONS` is the final
+  Planner cap.
+- Each Executor task has at most 25 command-selection rounds, plus five human
+  recovery rounds in interactive mode. Three consecutive no-progress rounds
+  stop the task.
+- Each host assessment has at most 12 LLM rounds. Three consecutive rounds with
+  no executable progress stop that host worker.
+- Multiple tool calls in one Executor response run concurrently with asyncio.
+- The SSH command timeout is 600 seconds. `LLM_TIMEOUT_SECONDS` applies only to
+  LiteLLM requests.
+- Transient LLM provider/network failures receive only the bounded retry count
+  configured by `LLM_MAX_RETRIES`.
+- QA report evidence is compacted and artifact content is hash-deduplicated;
+  raw trajectory data remains authoritative.
+
+These limits bound execution and context growth without hard-coding a fixed
+attack order. The LLM still decides strategy, task decomposition, and semantic
+interpretation within the available tool and safety boundaries.
+
+## Human interaction and unattended mode
+
+With `HUMAN_INTERACTION=1` (the default), Planner, Executor, and Host QA may
+call `ask_human` when:
+
+- an expected file or artifact is missing;
+- a blocking global or host assessment needs correction or an explicit stop;
+- the Executor reaches its normal 25-round limit without a result.
+
+With `HUMAN_INTERACTION=0`, Cochise does not read stdin and removes `ask_human`
+from autonomous LLM tool surfaces. Blocking assessment findings are recorded
+and automatically overridden so the run can continue; this does not make the
+finding pass or repair the environment. Workers still stop after repeated
+rounds without executable progress.
+
+## Testing and development validation
 
 ```bash
-# replay a run in your terminal (same rich output as live)
-uv run cochise-replay logs/run-20260402-095548.json
+# Unit tests (the repository uses unittest; pytest is not required)
+uv run python -m unittest discover -s tests -q
 
-# tabular overview: rounds, tokens, costs, compromised accounts
-uv run cochise-analyze-logs index-rounds-and-tokens logs/*.json
+# Syntax check
+uv run python -m compileall -q src
 
-# generate graphs: context growth, token usage over time
-uv run cochise-analyze-graphs logs/run-20260402-095548.json
+# CLI entry points
+uv run cochise --help
+uv run cochise-replay --help
+uv run cochise-analyze-logs --help
+uv run cochise-analyze-graphs --help
 ```
 
-The analysis tools support LaTeX table export for academic papers.
+Unit tests do not replace live Cyber Range validation. A live run still needs a
+reachable attacker VM, a tool-calling model, and a test environment within the
+authorized scope.
 
-## Adapting Cochise
+> **中文摘要：** 可用 unittest、compileall 與 CLI help 驗證本地程式；這些不
+> 代表 live Cyber Range 或真實 LLM 執行已完成驗證。
 
-### Use a different scenario
+## Repository layout
 
-Cochise is not locked to Active Directory. The attack scenario is a Markdown template at `src/cochise/templates/scenario.md` and can be changed to different domains. The pre-configured `Executor` tools always connect to a linux VM for executing the selected commands but the tool-set can be extended.
+| Path | Responsibility |
+|---|---|
+| `src/cochise/cli/cochise.py` | Main entry point, `.env`, LLM/SSH/QA wiring. |
+| `src/cochise/common.py` | LiteLLM wrapper, provider mapping, tool schemas, retry/timeout. |
+| `src/cochise/planner.py` | Persistent Planner, plan compaction, host QA gates. |
+| `src/cochise/executor.py` | Ephemeral Executor, parallel tools, human recovery. |
+| `src/cochise/assessment.py` | Range specs, black-box/control-plane/victim adapters, global/host QA. |
+| `src/cochise/qa_guidance.py` | Raw human QA guidance, provenance, hash, bounded semantic context. |
+| `src/cochise/qa_report.py` | Live Markdown report, redaction, coverage/conformance. |
+| `src/cochise/artifacts.py` | JSONL artifact manifest and content-hash deduplication. |
+| `src/cochise/knowledge.py` | Accounts, entities, hosts, findings, expectations, privileges, shells. |
+| `src/cochise/ssh_connection.py` | AsyncSSH attacker/Kali transport. |
+| `src/cochise/logger.py` | Rich console and `logs/run-*.json` structured trajectory. |
+| `src/cochise/templates/scenario.md` | Current objective, rules, and tool guidance system context. |
+| `src/cochise/templates/assessment_prompt.md.jinja2` | Host QA semantic assessment and evidence contract. |
+| `src/cochise/templates/range_spec.schema.json` | Optional permissive white-box field hint. |
+| `tests/` | LLM config, tool call, assessment, report, and guidance tests. |
+| `docs/` | Walkthrough, historical GOAD setup, and OPSEC design documents. |
 
-### Architecture and Implementation
+## Troubleshooting
 
-The codebase is structured for readability, not abstraction. The core files (I am using `tokei` for counting python lines-of-code and are not counting doc-strings within source files):
+### The spec file is not found
 
-| File | Lines Python Code | Purpose |
-|---|---|---|
-| `planner.py` | 131 | Strategic planning loop |
-| `executor.py` | 129 | Tactical command execution |
-| `knowledge.py` | 73 | Credential & entity tracking |
-| `common.py` | 89 | LLM interface (litellm wrapper) |
-| `logger.py` | 80 | Structured JSON + Rich console logging |
-| `assessment.py` | -- | Cyber Range preflight, host gates, findings, and white-box loading |
-| `ssh_connection.py` | 37 | Async SSH with timeout and reconnect |
+`RANGE_SPEC_PATH` is resolved from the current working directory; it is not a
+positional argument. Verify the path first:
 
-See [walkthrough.md](docs/walkthrough.md) for a detailed code walkthrough.
-
-## Publication
-
-This work is published in ACM Transactions on Software Engineering and Methodology (TOSEM):
-
-```bibtex
-@article{10.1145/3766895,
-author = {Happe, Andreas and Cito, J\"{u}rgen},
-title = {Can LLMs Hack Enterprise Networks? Autonomous Assumed Breach Penetration-Testing Active Directory Networks},
-year = {2025},
-publisher = {Association for Computing Machinery},
-address = {New York, NY, USA},
-issn = {1049-331X},
-url = {https://doi.org/10.1145/3766895},
-doi = {10.1145/3766895},
-note = {Just Accepted},
-journal = {ACM Trans. Softw. Eng. Methodol.},
-month = sep,
-keywords = {Security Capability Evaluation, Large Language Models, Enterprise Networks}
-}
+```bash
+pwd
+test -r "$PWD/specs/environment.md"
 ```
 
-We also provide a reproducibility report containing install instructions as RCR report at [arxiv](https://arxiv.org/abs/2603.01789).
+Then set an absolute or correct relative path in `.env`:
 
-## Background
+```dotenv
+RANGE_MODE=whitebox
+RANGE_SPEC_PATH=/absolute/path/to/specs/environment.md
+```
 
-I have been working on [hackingBuddyGPT](https://github.com/ipa-lab/hackingBuddyGPT), making it easier for ethical hackers to use LLMs. My main focus are single-host linux systems and privilege-escalation attacks within them.
+White-box mode without `RANGE_SPEC_PATH` stops with a configuration error. An
+empty file is rejected by the QA guidance loader. An empty or malformed range
+spec is retained as raw text so the semantic worker can report the ambiguity;
+the loader does not invent a topology.
 
-When OpenAI opened up API access to its o1 model on January, 24th 2025 and I saw the massive quality improvement over GPT-4o, one of my initial thoughts was "could this be used for more-complex pen-testing tasks.. for example, performing Assumed Breach simulations against Active Directory networks?"
+### QA still follows the AD scenario
 
-To evaluate the LLM's capabilities I set up the great [GOADv3](https://github.com/Orange-Cyberdefense/GOAD) testbed and wrote the simple prototype that you're currently looking at. This work is only intended to be used against security testbeds, never against real system (you know, as long as we do not understand how AI decision-making happens, you wouldn't want to use an LLM for taking potentially destructive decisions).
+`scenario.md` is the system context for Planner, Executor, and Assessment. The
+checked-in scenario is AD-oriented. `--qa-instructions` adds QA intent; it does
+not replace the scenario. Change
+`src/cochise/templates/scenario.md` when the ordinary attack objective must be
+changed.
 
-**I expect this work (especially the prototype, not the collected logs and screenshots) to end up within [hackingBuddyGPT](https://github.com/ipa-lab/hackingBuddyGPT) eventually.**
+### What should `TARGET_HOST` contain?
 
-## Disclaimer
+Use the address of the attacker/Kali VM that accepts SSH from the machine
+running Cochise. It is not automatically the AD DC or a victim endpoint. Direct
+victim execution requires a configured victim adapter or an LLM-driven attack
+path that reaches the host and registers access.
 
-This tool is intended for authorized security testing, academic research, and educational purposes only. Only use Cochise against systems you own or have explicit written permission to test. Unauthorized access to computer systems is illegal. The authors assume no liability for misuse.
+### The run is slow or produces many LLM calls
+
+Check whether the healthcheck, global/host QA, Planner compaction, human
+recovery, and retry settings are enabled. Bound the run with `MAX_RUN_TIME`,
+`PLANNER_MAX_CONTEXT_SIZE`, and `PLANNER_HARD_MAX_INTERACTIONS`. Use the JSON
+logs and analysis commands to inspect prompt tokens, cached tokens, duration,
+and cost. `LLM_TIMEOUT_SECONDS` is not the SSH timeout; SSH remains 600 seconds.
+
+### The reverse shell is connected but the agent cannot continue from it
+
+Register a unique `shell_id` with host, platform, identity, privilege, working
+directory, and transport. Use that same ID for subsequent shell commands. If the
+victim adapter does not implement `execute_shell_command`, the core can retain
+session metadata but cannot maintain the persistent transport for the agent.
+
+> **中文摘要：** Spec 路徑、AD scenario、Kali `TARGET_HOST` 與 reverse-shell
+> routing 是最常見的設定問題；先檢查 `.env` override 與 `shell_id` provenance。
+
+## Upstream and research context
+
+This repository is derived from the original
+[andreashappe/cochise](https://github.com/andreashappe/cochise) Planner/Executor
+prototype. Research background:
+
+- [Can LLMs Hack Enterprise Networks?](https://arxiv.org/abs/2502.04227)
+- [Reproducibility and replication report](https://arxiv.org/abs/2603.01789)
+- [GOAD](https://github.com/Orange-Cyberdefense/GOAD) test environment
+
+`docs/running-cochise-vs-goat.md` retains historical GOAD/VM setup material.
+Its hardware, versions, and benchmark results are not guarantees for the
+current fork or for a live run.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT License; see [LICENSE](LICENSE).
