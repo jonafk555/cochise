@@ -1067,6 +1067,7 @@ class AssessmentExecutor:
     """Tool-calling LLM worker for the per-host assessment phase."""
 
     MAX_ROUNDS = 12
+    MAX_NO_PROGRESS_ROUNDS = 3
 
     def __init__(
         self,
@@ -1140,13 +1141,16 @@ class AssessmentExecutor:
             "context": context,
             "mode": mode,
             "max_rounds": self.MAX_ROUNDS,
+            "autonomous": not getattr(self.human_interaction, "enabled", True),
         })
         history = [
             {"role": "system", "content": self.scenario},
             {"role": "user", "content": prompt},
         ]
-        tools = LLMFunctionMapping(self.configured_tools + [
-            self.ask_human,
+        tool_functions = list(self.configured_tools)
+        if getattr(self.human_interaction, "enabled", True):
+            tool_functions.append(self.ask_human)
+        tool_functions.extend([
             local_knowledge.add_assessment_finding,
             local_knowledge.add_entity_information,
             local_knowledge.add_assessment_expectation,
@@ -1156,35 +1160,46 @@ class AssessmentExecutor:
             local_knowledge.register_shell_session,
             local_knowledge.update_shell_session,
         ])
+        tools = LLMFunctionMapping(tool_functions)
         if self.victim_adapter:
-            tools = LLMFunctionMapping(
-                self.configured_tools
-                + [
-                    self.victim_adapter.execute_victim_command,
-                    self.victim_adapter.execute_shell_command,
-                    self.ask_human,
-                    local_knowledge.add_assessment_finding,
-                    local_knowledge.add_entity_information,
-                    local_knowledge.add_assessment_expectation,
-                    local_knowledge.update_assessment_expectation,
-                    local_knowledge.set_expectation_manifest,
-                    local_knowledge.record_host_privilege,
-                    local_knowledge.register_shell_session,
-                    local_knowledge.update_shell_session,
-                ]
-            )
+            victim_tool_functions = list(self.configured_tools)
+            victim_tool_functions.extend([
+                self.victim_adapter.execute_victim_command,
+                self.victim_adapter.execute_shell_command,
+            ])
+            if getattr(self.human_interaction, "enabled", True):
+                victim_tool_functions.append(self.ask_human)
+            victim_tool_functions.extend([
+                local_knowledge.add_assessment_finding,
+                local_knowledge.add_entity_information,
+                local_knowledge.add_assessment_expectation,
+                local_knowledge.update_assessment_expectation,
+                local_knowledge.set_expectation_manifest,
+                local_knowledge.record_host_privilege,
+                local_knowledge.register_shell_session,
+                local_knowledge.update_shell_session,
+            ])
+            tools = LLMFunctionMapping(victim_tool_functions)
         summary: str | None = None
         stopped = False
         tool_result_count = 0
         tool_evidence: list[dict[str, Any]] = []
+        no_progress_rounds = 0
 
         for _round in range(1, self.MAX_ROUNDS + 1):
+            self.logger.console.log(
+                f"Assessment[{host_id}] selecting next action "
+                f"({_round}/{self.MAX_ROUNDS})..."
+            )
             response_message, costs, duration = llm_tool_call(
                 self.model,
                 self.api_key,
                 tools,
                 history,
                 operation="host assessment",
+            )
+            self.logger.console.log(
+                f"Assessment[{host_id}] LLM call completed in {duration:.2f}s."
             )
             self.logger.log_llm_call("assessment_host", response_message, costs, duration, output=False)
             history.append(message_to_json(response_message))
@@ -1194,6 +1209,17 @@ class AssessmentExecutor:
                     summary = response_message.content
                     break
                 history.append({"role": "user", "content": "Continue the assessment and record findings."})
+                no_progress_rounds += 1
+                if no_progress_rounds >= self.MAX_NO_PROGRESS_ROUNDS:
+                    self.logger.log_data(
+                        "assessment_host_no_progress",
+                        (
+                            f"No executable assessment progress after "
+                            f"{self.MAX_NO_PROGRESS_ROUNDS} rounds; stopping host QA."
+                        ),
+                        output=True,
+                    )
+                    break
                 continue
 
             tool_calls = []
@@ -1226,7 +1252,7 @@ class AssessmentExecutor:
                         "tool_call_id": tool_call_id,
                     }
                     continue
-                self.logger.log_tool_call(function_name, tool_call_id, args, output=False)
+                self.logger.log_tool_call(function_name, tool_call_id, args, output=True)
                 tasks.append(asyncio.create_task(
                     perform_tool_call(
                         tool_call_id,
@@ -1239,6 +1265,7 @@ class AssessmentExecutor:
                 result = await task
                 tool_results[result["tool_call_id"]] = result
 
+            round_progressed = False
             for tool_call, function_name, args in tool_calls:
                 result = tool_results[getattr(tool_call, "id", "")]
                 tool_result_count += 1
@@ -1246,7 +1273,7 @@ class AssessmentExecutor:
                     result["tool"],
                     result["tool_call_id"],
                     result["result"],
-                    output=False,
+                    output=True,
                 )
                 metadata = result.get("metadata", {}) or {}
                 if result["tool"] in {
@@ -1318,7 +1345,27 @@ class AssessmentExecutor:
                     )
                 if result["tool"] == "ask_human" and is_stop_response(result["result"]):
                     stopped = True
+                elif (
+                    args is not None
+                    and tools.has_function(function_name)
+                    and result["tool"] != "ask_human"
+                ):
+                    round_progressed = True
             if stopped:
+                break
+            if round_progressed:
+                no_progress_rounds = 0
+            else:
+                no_progress_rounds += 1
+            if no_progress_rounds >= self.MAX_NO_PROGRESS_ROUNDS:
+                self.logger.log_data(
+                    "assessment_host_no_progress",
+                    (
+                        f"No executable assessment progress after "
+                        f"{self.MAX_NO_PROGRESS_ROUNDS} rounds; stopping host QA."
+                    ),
+                    output=True,
+                )
                 break
 
         if summary is None and not stopped:

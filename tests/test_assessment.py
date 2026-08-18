@@ -3,9 +3,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from cochise.assessment import (
     AssessmentFinding,
+    AssessmentExecutor,
     AssessmentResult,
     BlackBoxRangeAdapter,
     CompositeRangeAdapter,
@@ -31,8 +34,74 @@ class FakeLogger:
     def log_data(self, name, data=None, output=True):
         self.events.append((name, data))
 
+    def log_llm_call(self, name, result, costs, duration, output=True):
+        self.events.append((name, result))
+
+    def log_tool_call(self, name, tool_call_id, params, output=True):
+        self.events.append(("tool_call", name))
+
+    def log_tool_result(self, name, tool_call_id, result, output=True):
+        self.events.append(("tool_result", name))
+
+    def log_append_to_history(self, entry, source="manual", output=True):
+        self.events.append(("history", source))
+
 
 class AssessmentTests(unittest.TestCase):
+    def test_autonomous_host_assessment_stops_repeated_human_requests(self):
+        async def scenario():
+            logger = FakeLogger()
+            worker = AssessmentExecutor(
+                "model",
+                None,
+                "scenario",
+                [],
+                logger,
+                human_interaction=SimpleNamespace(enabled=False),
+            )
+            response = SimpleNamespace(
+                role="assistant",
+                content=None,
+                tool_calls=[
+                    SimpleNamespace(
+                        id="human-call",
+                        function=SimpleNamespace(
+                            name="ask_human",
+                            arguments='{"question":"help","reason":"blocked"}',
+                        ),
+                    )
+                ],
+            )
+            captured_tools = []
+
+            def fake_tool_call(*args, **kwargs):
+                captured_tools.append(args[2])
+                return response, {"prompt_tokens": 1}, 0.01
+
+            with patch(
+                "cochise.assessment.llm_tool_call",
+                side_effect=fake_tool_call,
+            ) as tool_call, patch(
+                "cochise.assessment.llm_call",
+                return_value=(
+                    {"content": "Assessment stopped after no executable progress."},
+                    0.01,
+                    {"prompt_tokens": 1},
+                ),
+            ):
+                result = await worker.assess_host("host-a", "{}", "blackbox")
+
+            self.assertEqual(tool_call.call_count, worker.MAX_NO_PROGRESS_ROUNDS)
+            self.assertTrue(captured_tools)
+            self.assertFalse(captured_tools[0].has_function("ask_human"))
+            self.assertIn("no executable progress", result.summary.lower())
+            self.assertTrue(any(
+                name == "assessment_host_no_progress"
+                for name, _data in logger.events
+            ))
+
+        asyncio.run(scenario())
+
     def test_finding_redacts_sensitive_evidence(self):
         finding = AssessmentFinding(
             finding_id="f-1",

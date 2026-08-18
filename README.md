@@ -88,9 +88,10 @@ TARGET_USERNAME='root'
 TARGET_PASSWORD='kali'
 
 # Optional: runtime limits
-MAX_RUN_TIME=7200                  # stop after N seconds (0 = unlimited), this is best effort not a hard limit
+MAX_RUN_TIME=7200                  # stop after N seconds (0 = unlimited)
 PLANNER_MAX_CONTEXT_SIZE=250000    # compact history at N tokens
 PLANNER_MAX_INTERACTIONS=0         # max planner rounds (0 = unlimited) before history compaction
+PLANNER_HARD_MAX_INTERACTIONS=100  # safety cap for planner rounds (0 = unlimited)
 
 # Cyber Range assessment
 RANGE_MODE='blackbox'              # blackbox or whitebox
@@ -102,6 +103,8 @@ QA_REPORT_PATH='logs/qa-report.md' # continuously updated Markdown QA report
 QA_ARTIFACT_DIR=''                  # optional single directory for deduplicated artifact index
 LLM_HEALTHCHECK=1                  # verify tool calling before preflight
 HUMAN_INTERACTION=1                # set to 0 to disable prompts; continue autonomously
+# Optional for OpenAI GPT-5.4+ tool calls: none (default), low, medium, high, ...
+LLM_REASONING_EFFORT='none'
 ```
 
 Cochise uses LiteLLM underneath, so the planner and executor use the same
@@ -144,6 +147,12 @@ with fully-qualified LiteLLM model names such as
 `openrouter/google/gemini-3-flash-preview`. Local models must support chat
 tool/function calling because Cochise delegates SSH and knowledge-base actions
 through tools.
+
+For OpenAI GPT-5.4+ deployments, Cochise sends tool calls with
+`reasoning_effort=none` by default. This avoids the endpoint error that occurs
+when function tools are combined with a non-`none` reasoning effort. Choose
+another supported value only when the configured endpoint supports that
+combination (typically through its Responses API).
 
 ### Cyber Range QA
 
@@ -262,18 +271,18 @@ hash into one `artifact-manifest.jsonl` under `QA_ARTIFACT_DIR`, or by default i
 
 ### Human-in-the-loop
 
-The agent can call `ask_human` when it is blocked or cannot find an expected
-file/artifact. If an Executor reaches its normal 25-round limit without a
-result, Cochise pauses in the terminal and asks for guidance automatically.
-Enter a file path, copy instructions, credentials, or another next step. Enter
-`stop` to stop the current run. The response is added to the agent history and
-the Executor gets a short recovery window to continue.
+With `HUMAN_INTERACTION=1`, the agent can call `ask_human` when it is blocked or
+cannot find an expected file/artifact. If an Executor reaches its normal
+25-round limit without a result, Cochise pauses in the terminal and asks for
+guidance automatically. Enter a file path, copy instructions, credentials, or
+another next step. Enter `stop` to stop the current run. The response is added
+to the agent history and the Executor gets a short recovery window to continue.
 
 For unattended execution, set `HUMAN_INTERACTION=0`. Cochise will not read
-stdin; every human request returns an autonomous continuation instruction. The
-run continues through blocking assessment findings and records the automatic
-override in the log. Use `HUMAN_INTERACTION=1` when a human must approve or
-reject a blocking finding.
+stdin; programmatic blocking assessment gates are automatically recorded and
+overridden, while `ask_human` is removed from the LLM tool surface. Assessment
+and Executor workers stop after repeated rounds without executable progress.
+Use `HUMAN_INTERACTION=1` when a human must approve or reject a blocking finding.
 
 ## Analysis Tools
 

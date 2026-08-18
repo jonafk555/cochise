@@ -28,6 +28,7 @@ class HumanInteraction:
         self.console = console
         self.enabled = enabled
         self._input_lock = asyncio.Lock()
+        self._autonomous_notice_logged = False
 
     async def ask_human(self, question: str, reason: str) -> str:
         """Ask a human for guidance when the agent is blocked or missing an artifact.
@@ -50,9 +51,11 @@ class HumanInteraction:
         """
 
         if not self.enabled:
-            self.console.log(
-                "[yellow]Human interaction disabled; continuing autonomously.[/yellow]"
-            )
+            if not self._autonomous_notice_logged:
+                self.console.log(
+                    "[yellow]Human interaction disabled; continuing autonomously.[/yellow]"
+                )
+                self._autonomous_notice_logged = True
             return "continue autonomously"
 
         async with self._input_lock:

@@ -18,10 +18,26 @@ class LLMCallError(RuntimeError):
         self.model = model
         self.attempts = attempts
         self.cause = cause
+        cause_text = str(cause).lower()
+        if "reasoning_effort" in cause_text and (
+            "tool" in cause_text or "function" in cause_text
+        ):
+            hint = (
+                "Check the model's tool-calling API compatibility and set "
+                "LLM_REASONING_EFFORT=none for Chat Completions."
+            )
+        elif any(
+            marker in cause_text
+            for marker in ("network", "connecterror", "timed out", "timeout")
+        ):
+            hint = (
+                "Check network access, proxy settings, and the configured API endpoint."
+            )
+        else:
+            hint = "Check the configured provider, model, and request parameters."
         super().__init__(
             f"LLM {operation} failed for {model} after {attempts} attempt(s): "
-            f"{type(cause).__name__}: {cause}. "
-            "Check network access, proxy settings, and the configured API endpoint."
+            f"{type(cause).__name__}: {cause}. {hint}"
         )
 
 
@@ -60,6 +76,78 @@ class LLMConfig:
         if self.api_base:
             result["api_base"] = self.api_base
         return result
+
+
+_REASONING_EFFORT_VALUES = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "default"}
+)
+
+
+def _model_provider(model: str | LLMConfig) -> str:
+    """Return the provider used for compatibility decisions."""
+
+    if isinstance(model, LLMConfig):
+        provider = model.provider.strip().lower()
+        if provider not in {"", "litellm"}:
+            return provider
+        return _provider_from_model(model.model)
+    return _provider_from_model(model)
+
+
+def _model_name(model: str | LLMConfig) -> str:
+    configured_model = model.model if isinstance(model, LLMConfig) else model
+    return configured_model.rsplit("/", 1)[-1].strip().lower()
+
+
+def _is_openai_tool_reasoning_model(model: str | LLMConfig) -> bool:
+    """Return whether Chat Completions needs an explicit no-reasoning setting.
+
+    OpenAI GPT-5.4+ deployments reject function tools together with a non-none
+    ``reasoning_effort`` on ``/v1/chat/completions``.  The version suffix is
+    intentionally parsed instead of matching one model alias so compatible
+    deployments such as ``gpt-5.6-luna`` receive the same treatment.
+    """
+
+    provider = _model_provider(model)
+    is_openai_compatible_local = (
+        isinstance(model, LLMConfig)
+        and provider == "local"
+        and model.local_backend == "openai-compatible"
+    )
+    if provider != "openai" and not is_openai_compatible_local:
+        return False
+
+    model_name = _model_name(model)
+    if not model_name.startswith("gpt-5.") or "gpt-5-chat" in model_name:
+        return False
+    try:
+        major = int(
+            model_name.removeprefix("gpt-5.")
+            .split(".", 1)[0]
+            .split("-", 1)[0]
+        )
+    except (ValueError, IndexError):
+        return False
+    return major >= 4
+
+
+def _tool_call_compatibility_kwargs(model: str | LLMConfig) -> dict[str, str]:
+    """Return provider parameters required for tool calls to remain usable."""
+
+    if not _is_openai_tool_reasoning_model(model):
+        return {}
+
+    configured = _env_first("LLM_REASONING_EFFORT")
+    if configured:
+        configured = configured.lower()
+        if configured not in _REASONING_EFFORT_VALUES:
+            allowed = ", ".join(sorted(_REASONING_EFFORT_VALUES))
+            raise ValueError(
+                f"LLM_REASONING_EFFORT must be one of {allowed}"
+            )
+        return {"reasoning_effort": configured}
+
+    return {"reasoning_effort": "none"}
 
 
 def _env_first(*names: str) -> str | None:
@@ -494,6 +582,7 @@ def llm_tool_call(
         "messages": messages,
         "tools": tools.get_tool_definitions(),
         **_completion_kwargs(model, api_key),
+        **_tool_call_compatibility_kwargs(model),
     }
     if tool_choice is not None:
         completion_kwargs["tool_choice"] = tool_choice
@@ -591,6 +680,7 @@ def llm_call(
     }
     if tools is not None:
         completion_kwargs["tools"] = tools
+        completion_kwargs.update(_tool_call_compatibility_kwargs(model))
     response = _completion_with_retry(
         completion_kwargs,
         operation=operation,

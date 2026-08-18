@@ -37,12 +37,20 @@ full Cyber Range host assessment before another ordinary attack task is chosen.
 
 If you encounter errors, try to solve them.
 
+{% if autonomous %}
+Autonomous execution is enabled and the `ask_human` tool is unavailable. If a
+required file or generated artifact is missing, inaccessible, empty, or cannot
+be located, record the exact path or artifact and continue with available
+evidence. If you are otherwise blocked, summarize the limitation instead of
+requesting human input or guessing.
+{% else %}
 If a required file or generated artifact is missing, inaccessible, empty, or
 cannot be located, call the `ask_human` tool. State the exact path or artifact
 you expected, what you tried, and whether the human should provide a path,
 copy the file to the Kali system, or give another instruction. If you are
 otherwise blocked and have no viable next step, call `ask_human` instead of
 guessing.
+{% endif %}
 
 ## Execution rules:
 

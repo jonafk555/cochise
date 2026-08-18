@@ -24,6 +24,7 @@ PLANNER_STRUCTURE = (TEMPLATE_DIR / "planner_structure.md").read_text()
 PROMPT = (TEMPLATE_DIR / "planner_prompt.md").read_text()
 MAX_AUTONOMOUS_NO_PROGRESS_ROUNDS = 3
 MAX_TOOL_REPAIR_ROUNDS = 3
+DEFAULT_HARD_MAX_INTERACTIONS = 100
 
 class Planner:
     
@@ -39,6 +40,7 @@ class Planner:
         max_interactions: int = 0,
         human_interaction=None,
         assessment_coordinator=None,
+        hard_max_interactions: int = DEFAULT_HARD_MAX_INTERACTIONS,
     ):
         self.model = model
         self.model_api_key = model_api_key
@@ -48,6 +50,7 @@ class Planner:
         self.max_runtime = max_runtime
         self.max_context_size = max_context_size
         self.max_interactions = max_interactions
+        self.hard_max_interactions = hard_max_interactions
         self.human_interaction = human_interaction or HumanInteraction(logger.console)
         self.assessment_coordinator = assessment_coordinator
         self.human_stop_requested = False
@@ -171,15 +174,17 @@ class Planner:
     def _build_tool_mapping(self, executor) -> LLMFunctionMapping:
         """Build the Planner tool surface advertised to the LLM."""
 
-        return LLMFunctionMapping([
-            executor.perform_task,
-            self.ask_human,
+        tool_functions = [executor.perform_task]
+        if getattr(self.human_interaction, "enabled", True):
+            tool_functions.append(self.ask_human)
+        tool_functions.extend([
             self.knowledge.register_host_access,
             self.knowledge.add_compromised_account,
             self.knowledge.update_compromised_account,
             self.knowledge.add_entity_information,
             self.knowledge.update_entity_information,
         ])
+        return LLMFunctionMapping(tool_functions)
 
     async def _run_global_preflight(self) -> bool:
         if self.assessment_coordinator is None or self.preflight_complete:
@@ -273,7 +278,7 @@ class Planner:
                 )
                 continue
 
-            self.logger.log_tool_call(function_name, tool_call_id, args, output=False)
+            self.logger.log_tool_call(function_name, tool_call_id, args, output=True)
 
             # this could be cleaner:
             # set tool call id in the executor logger, just in case the executor is run
@@ -310,11 +315,15 @@ class Planner:
 
             if function_name == "ask_human" and is_stop_response(str(result)):
                 self.human_stop_requested = True
-            if function_name != "ask_human":
+            if function_name == "perform_task":
+                progressed = progressed or bool(
+                    getattr(executor, "last_task_progressed", True)
+                )
+            elif function_name != "ask_human":
                 progressed = True
 
             result = str(result)
-            self.logger.log_tool_result(function_name, tool_call_id, result, output=False)
+            self.logger.log_tool_result(function_name, tool_call_id, result, output=True)
             msg = {
                 "role": "tool",
                 "name": function_name,
@@ -376,7 +385,13 @@ class Planner:
 
         # IDEA: I could use a progress bar to show the remaining runtime
         # IDEA: I could also output the currently used context size
-        while( self.max_runtime == 0 or (datetime.datetime.now()- started).total_seconds() <= self.max_runtime):
+        while (
+            (self.max_runtime == 0 or (datetime.datetime.now() - started).total_seconds() <= self.max_runtime)
+            and (
+                self.hard_max_interactions == 0
+                or interaction_counter < self.hard_max_interactions
+            )
+        ):
 
             if not await self._run_pending_host_assessments():
                 human_stopped = True
@@ -514,3 +529,12 @@ class Planner:
             self.logger.log_data("completed", "Human operator stopped the planner.", output=True)
         elif self.max_runtime != 0 and (datetime.datetime.now() - started).total_seconds() > self.max_runtime:
             self.logger.log_data("completed", f"Max runtime of {self.max_runtime} seconds exceeded, stopping planner loop.", output=True)
+        elif (
+            self.hard_max_interactions != 0
+            and interaction_counter >= self.hard_max_interactions
+        ):
+            self.logger.log_data(
+                "completed",
+                f"Hard planner interaction limit of {self.hard_max_interactions} reached.",
+                output=True,
+            )

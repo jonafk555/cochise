@@ -135,6 +135,83 @@ class LLMConfigTests(unittest.TestCase):
 
         self.assertEqual(captured["tools"], tools)
 
+    def test_gpt_5_4_plus_tool_calls_disable_reasoning_by_default(self):
+        captured = {}
+
+        def fake_completion(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+                _hidden_params={},
+            )
+
+        config = common.LLMConfig(
+            provider="openai",
+            model="openai/gpt-5.6-luna",
+        )
+        tools = common.LLMFunctionMapping([common._llm_healthcheck_tool])
+        with patch.object(common.litellm, "completion", fake_completion):
+            common.llm_tool_call(
+                config,
+                None,
+                tools,
+                [{"role": "user", "content": "ping"}],
+            )
+
+        self.assertEqual(captured["reasoning_effort"], "none")
+
+    def test_tool_reasoning_effort_can_be_overridden(self):
+        captured = {}
+
+        def fake_completion(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+                _hidden_params={},
+            )
+
+        config = common.LLMConfig(
+            provider="openai",
+            model="openai/gpt-5.6-luna",
+        )
+        tools = common.LLMFunctionMapping([common._llm_healthcheck_tool])
+        with patch.dict(os.environ, {"LLM_REASONING_EFFORT": "low"}), patch.object(
+            common.litellm, "completion", fake_completion
+        ):
+            common.llm_tool_call(
+                config,
+                None,
+                tools,
+                [{"role": "user", "content": "ping"}],
+            )
+
+        self.assertEqual(captured["reasoning_effort"], "low")
+
+    def test_regular_openai_tool_calls_omit_reasoning_effort(self):
+        captured = {}
+
+        def fake_completion(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+                _hidden_params={},
+            )
+
+        config = common.LLMConfig(provider="openai", model="openai/gpt-4o")
+        tools = common.LLMFunctionMapping([common._llm_healthcheck_tool])
+        with patch.object(common.litellm, "completion", fake_completion):
+            common.llm_tool_call(
+                config,
+                None,
+                tools,
+                [{"role": "user", "content": "ping"}],
+            )
+
+        self.assertNotIn("reasoning_effort", captured)
+
     def test_llm_healthcheck_requires_a_tool_call(self):
         captured = {}
 

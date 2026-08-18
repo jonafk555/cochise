@@ -103,6 +103,19 @@ class ToolCallTests(unittest.TestCase):
         )
         self.assertIn("Do not call ask_human", planner._planner_execution_prompt())
 
+    def test_autonomous_planner_tool_surface_excludes_ask_human(self):
+        logger = _Logger()
+        interaction = SimpleNamespace(enabled=False)
+        planner = Planner("model", None, "scenario", None, logger, human_interaction=interaction)
+
+        names = [
+            item["function"]["name"]
+            for item in planner._build_tool_mapping(_Executor()).get_tool_definitions()
+        ]
+
+        self.assertNotIn("ask_human", names)
+        self.assertIn("perform_task", names)
+
     def test_planner_reports_progress_for_valid_tool_call(self):
         async def scenario():
             logger = _Logger()
@@ -277,6 +290,149 @@ class ToolCallTests(unittest.TestCase):
             self.assertEqual(llm_call.call_count, 3)
             self.assertIn(
                 "Planner stopped after repeated non-tool responses in autonomous mode.",
+                [data for name, data in logger.data if name == "completed"],
+            )
+
+        asyncio.run(scenario())
+
+    def test_autonomous_engage_stops_when_executor_did_no_work(self):
+        async def scenario():
+            logger = _Logger()
+            planner = Planner(
+                "model",
+                None,
+                "scenario",
+                None,
+                logger,
+                max_runtime=60,
+                human_interaction=SimpleNamespace(enabled=False),
+            )
+
+            class Preflight:
+                async def run_global_preflight(self, knowledge):
+                    return AssessmentResult(
+                        assessment_id="global-test",
+                        scope="global",
+                        mode="blackbox",
+                        target="cyber-range",
+                        status="pass",
+                        summary="preflight ok",
+                    )
+
+                async def assess_host(self, host_id, knowledge):
+                    return None
+
+            class NoProgressExecutor(_Executor):
+                last_task_progressed = False
+
+                async def perform_task(
+                    self,
+                    next_step: str,
+                    next_step_context: str,
+                    mitre_attack_tactic: str,
+                    mitre_attack_technique: str,
+                ):
+                    return "No command was executed", Knowledge(logger)
+
+            class Factory:
+                def build(self, knowledge):
+                    return NoProgressExecutor()
+
+            planner.assessment_coordinator = Preflight()
+            planner.executor_factory = Factory()
+            planner.create_initial_plan = lambda: "1.1 Execute the first task"
+            response = SimpleNamespace(
+                role="assistant",
+                content=None,
+                tool_calls=[
+                    _call(
+                        "call-task",
+                        "perform_task",
+                        (
+                            '{"next_step":"execute first task",'
+                            '"next_step_context":"target context",'
+                            '"mitre_attack_tactic":"Discovery",'
+                            '"mitre_attack_technique":"Network Service Scanning"}'
+                        ),
+                    ),
+                ],
+            )
+
+            with patch(
+                "cochise.planner.llm_tool_call",
+                side_effect=[(response, {"prompt_tokens": 1}, 0.01)] * 3,
+            ) as llm_call:
+                await planner.engage()
+
+            self.assertEqual(llm_call.call_count, 3)
+            self.assertIn(
+                "Planner stopped after repeated rounds without executable progress.",
+                [data for name, data in logger.data if name == "completed"],
+            )
+
+        asyncio.run(scenario())
+
+    def test_autonomous_engage_honors_hard_interaction_limit(self):
+        async def scenario():
+            logger = _Logger()
+            planner = Planner(
+                "model",
+                None,
+                "scenario",
+                None,
+                logger,
+                max_runtime=60,
+                human_interaction=SimpleNamespace(enabled=False),
+                hard_max_interactions=2,
+            )
+
+            class Preflight:
+                async def run_global_preflight(self, knowledge):
+                    return AssessmentResult(
+                        assessment_id="global-test",
+                        scope="global",
+                        mode="blackbox",
+                        target="cyber-range",
+                        status="pass",
+                        summary="preflight ok",
+                    )
+
+                async def assess_host(self, host_id, knowledge):
+                    return None
+
+            class Factory:
+                def build(self, knowledge):
+                    return _Executor()
+
+            planner.assessment_coordinator = Preflight()
+            planner.executor_factory = Factory()
+            planner.create_initial_plan = lambda: "1.1 Execute the first task"
+            response = SimpleNamespace(
+                role="assistant",
+                content=None,
+                tool_calls=[
+                    _call(
+                        "call-task",
+                        "perform_task",
+                        (
+                            '{"next_step":"execute first task",'
+                            '"next_step_context":"target context",'
+                            '"mitre_attack_tactic":"Discovery",'
+                            '"mitre_attack_technique":"Network Service Scanning"}'
+                        ),
+                    ),
+                ],
+            )
+
+            with patch(
+                "cochise.planner.llm_tool_call",
+                side_effect=[(response, {"prompt_tokens": 1}, 0.01)] * 2,
+            ) as llm_call:
+                await planner.engage()
+
+            self.assertEqual(llm_call.call_count, 2)
+            self.assertIn(
+                "Hard planner interaction limit of 2 reached.",
                 [data for name, data in logger.data if name == "completed"],
             )
 

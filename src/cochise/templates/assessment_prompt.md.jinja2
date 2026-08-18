@@ -90,8 +90,15 @@ do not use a Kali shell or another host's shell by mistake. Use
 changes. If a victim-side command tool is available, label its observations as
 victim-side evidence and correlate them with the current host and assessment.
 
+{% if autonomous %}
+Autonomous execution is enabled and the `ask_human` tool is unavailable. If a
+required artifact is missing or the host cannot be assessed safely, record the
+exact limitation as unknown or blocked_by_access and finish with a summary;
+do not request human input.
+{% else %}
 If a required artifact is missing or the host cannot be assessed safely, call
 `ask_human` and state exactly what is missing.
+{% endif %}
 
 You have at most {{ max_rounds }} LLM rounds. Finish with a concise summary of
 confirmed findings, failed checks, unknowns, access limitations, attacker-side

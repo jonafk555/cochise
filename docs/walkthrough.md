@@ -26,7 +26,7 @@ The `async_main()` function is the single entry point. It performs setup in a st
 1. **Load configuration** from `.env` via `dotenv` and resolve an `LLMConfig` from `LLM_PROVIDER`, `LLM_MODEL`, the provider-specific API key, and the local endpoint settings. The legacy `LITELLM_MODEL`/`LITELLM_API_KEY` pair is also supported.
 2. **Validate LLM tool calling** with a small forced healthcheck. Planner, Executor, and assessment workers all depend on function calling.
 3. **Create SSH connection** (`get_ssh_connection_from_env()`) and connect to the target.
-4. **Initialize logger** with a `Rich` console for pretty output and `structlog` for JSON log files under `logs/`. `HUMAN_INTERACTION=0` disables stdin prompts and automatically continues; blocking assessment overrides are recorded in the log.
+4. **Initialize logger** with a `Rich` console for pretty output and `structlog` for JSON log files under `logs/`. `HUMAN_INTERACTION=0` disables stdin prompts, automatically records blocking assessment overrides, and removes `ask_human` from autonomous LLM tool surfaces.
 5. **Build components:** An `ExecutorFactory` is created with the model, API key, scenario text, the SSH `execute_command` tool, and the logger. A `RangeAssessmentCoordinator` is created with the black-box adapter and optional white-box spec. A `Planner` is created with the factory, assessment coordinator, and configuration limits.
 6. **Start the run** by calling `planner.engage()`. The Planner runs the mandatory global Cyber Range preflight before creating its initial attack plan. `QA_REPORT_PATH` points to a continuously updated Markdown report; it is refreshed after global and host assessments.
 
@@ -112,8 +112,10 @@ The assessment coordinator provides two mandatory gates:
 
 With human interaction enabled, blocking findings pause for human guidance. With
 `HUMAN_INTERACTION=0`, the coordinator records the finding and the Planner
-automatically overrides the gate so autonomous execution can continue. Cochise
-never performs automatic range remediation.
+automatically overrides the gate so autonomous execution can continue. The
+autonomous LLM workers do not receive `ask_human`, and bounded no-progress
+guards stop a worker that cannot produce executable work. Cochise never
+performs automatic range remediation.
 
 ---
 
@@ -205,10 +207,13 @@ change the agent workflow.
 uses a forced no-op function call, so a model/server without tool calling fails
 before Cyber Range assessment begins.
 
-The `ask_human` tool is registered for both planner and executor. It pauses
-the terminal without blocking the event loop, appends the response to the
-current conversation, and lets the model continue. The executor also asks
-automatically after exhausting its normal command-selection rounds.
+The `ask_human` tool is registered for the Planner and Executor when human
+interaction is enabled. It pauses the terminal without blocking the event
+loop, appends the response to the current conversation, and lets the model
+continue. In autonomous mode it is removed from the LLM tool surface;
+programmatic assessment gates record an automatic override instead. The
+interactive Executor also asks automatically after exhausting its normal
+command-selection rounds.
 
 ### `llm_call(model, api_key, messages)`
 

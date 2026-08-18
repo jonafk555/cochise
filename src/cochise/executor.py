@@ -69,6 +69,7 @@ TEMPLATE_DIR = pathlib.Path(__file__).parent / "templates"
 PROMPT = (TEMPLATE_DIR / "executor_prompt.md.jinja2").read_text()
 MAX_ROUNDS:int=25
 HUMAN_RECOVERY_ROUNDS:int=5
+MAX_NO_PROGRESS_ROUNDS:int=3
 
 class ExecutorFactory:
     def __init__(self, model, api_key, scenario, configured_tools, logger, human_interaction=None):
@@ -109,6 +110,7 @@ class Executor:
         self.system_knowledge = system_knowledge
         self.configured_tools = configured_tools
         self.human_interaction = human_interaction or HumanInteraction(logger.console)
+        self.last_task_progressed = False
 
     def setLogger(self, logger):
         self.logger = logger
@@ -147,12 +149,14 @@ class Executor:
             A summary of the performed task, including any relevant findings.
         """
 
+        self.last_task_progressed = False
         self.logger.log_data("executor", "Starting task: " + next_step)
         prompt = Template(PROMPT).render({
             'next_step': next_step,
             'next_step_context': next_step_context,
             'max': str(MAX_ROUNDS-1),
-            'knowledge': self.system_knowledge.get_knowledge()
+            'knowledge': self.system_knowledge.get_knowledge(),
+            'autonomous': not getattr(self.human_interaction, "enabled", True),
         })
             
         history = [
@@ -162,8 +166,10 @@ class Executor:
         self.logger.log_append_to_history(history, source='manual', output=False)
 
         knowledge = Knowledge(self.logger)
-        tools = LLMFunctionMapping(self.configured_tools + [
-            self.ask_human,
+        tool_functions = list(self.configured_tools)
+        if getattr(self.human_interaction, "enabled", True):
+            tool_functions.append(self.ask_human)
+        tool_functions.extend([
             knowledge.register_host_access,
             knowledge.add_compromised_account,
             knowledge.update_compromised_account,
@@ -173,6 +179,7 @@ class Executor:
             knowledge.register_shell_session,
             knowledge.update_shell_session,
         ])
+        tools = LLMFunctionMapping(tool_functions)
 
         prompt = f"[bold]Task: {next_step}\nCategorization:[/bold] {mitre_attack_tactic}/{mitre_attack_technique}\n\n[bold]Context:[/bold]\n{next_step_context}\n\n[bold]Existing Knowledge:[/bold]\n{self.system_knowledge.get_knowledge()}"
         self.logger.console.print(Panel(prompt, title="Executor Started"))
@@ -182,7 +189,12 @@ class Executor:
         summary = None
         human_asked = False
         human_stopped = False
-        max_rounds = MAX_ROUNDS + HUMAN_RECOVERY_ROUNDS
+        no_progress_rounds = 0
+        max_rounds = (
+            MAX_ROUNDS + HUMAN_RECOVERY_ROUNDS
+            if getattr(self.human_interaction, "enabled", True)
+            else MAX_ROUNDS
+        )
         while round <= max_rounds:
 
             if round == MAX_ROUNDS + 1 and not human_asked:
@@ -219,6 +231,9 @@ class Executor:
                     history,
                     operation="executor next action",
                 )
+                self.logger.console.log(
+                    f"Executor round {round} LLM call completed in {duration:.2f}s."
+                )
                 self.logger.log_llm_call('executor_next_cmds', response_message, costs, duration, output=False)
                 
                 self.logger.log_append_to_history(response_message, source='agent', output=False)
@@ -231,6 +246,7 @@ class Executor:
                 # ``continue`` appear to be ignored in an interactive terminal.
                 tool_calls = []
                 tool_results = {}
+                round_progressed = False
                 for tool_call in response_message.tool_calls:
                     function_name, args, parse_error = parse_tool_call(tool_call)
                     tool_call_id = getattr(tool_call, "id", "")
@@ -258,7 +274,7 @@ class Executor:
                             'tool_call_id': tool_call_id,
                         }
                         continue
-                    self.logger.log_tool_call(function_name, tool_call_id, args, output=False)
+                    self.logger.log_tool_call(function_name, tool_call_id, args, output=True)
 
                 command_calls = [
                     item for item in tool_calls
@@ -295,14 +311,6 @@ class Executor:
                             tool_results[result['tool_call_id']] = result
                             task_id = display[result['tool_call_id']]
                             progress.update(task_id, advance=100)
-                            if result['tool'] == 'execute_command':
-                                progress.console.print(
-                                    Panel(
-                                        result['result'],
-                                        title=f"Tool Result for {result['cmd']}",
-                                    ),
-                                    markup=False,
-                                )
 
                 # Human prompts must run after Progress has released the
                 # terminal.  They are still represented as normal tool results
@@ -338,7 +346,7 @@ class Executor:
                         result['tool'],
                         result['tool_call_id'],
                         result['result'],
-                        output=False,
+                        output=True,
                     )
                     msg = {
                         "tool_call_id": result['tool_call_id'],
@@ -348,6 +356,24 @@ class Executor:
                     }
                     history.append(msg)
                     self.logger.log_append_to_history(msg, source='agent', output=False)
+
+                    result_text = str(result.get('result', ''))
+                    result_is_error = result_text.startswith((
+                        "Error executing tool",
+                        "Unknown tool",
+                        "Invalid JSON arguments",
+                        "Tool call failed",
+                    ))
+                    result_is_missing = (
+                        result['tool'] == 'execute_command'
+                        and looks_like_missing_artifact(result['cmd'], result_text)
+                    )
+                    if (
+                        result['tool'] != 'ask_human'
+                        and not result_is_error
+                        and not result_is_missing
+                    ):
+                        round_progressed = True
 
                 # An explicit ask_human call takes precedence over the
                 # automatic missing-artifact prompt for this response.
@@ -366,30 +392,58 @@ class Executor:
                             and looks_like_missing_artifact(result['cmd'], result['result'])
                         ):
                             human_asked = True
-                            human_response = await self.ask_human(
-                                question=(
-                                    f"The command `{result['cmd']}` could not access an expected "
-                                    "file or artifact.\n\n"
-                                    f"Command output:\n{result['result'][-2000:]}\n\n"
-                                    "Provide the correct path, copy the file to the Kali machine, "
-                                    "or explain how to obtain it. Reply 'stop' to end the run."
-                                ),
-                                reason="An SSH command reported that an expected file or artifact is unavailable.",
-                            )
-                            human_message = {
-                                "role": "user",
-                                "content": f"Human guidance: {human_response}",
-                            }
-                            history.append(human_message)
-                            self.logger.log_append_to_history(
-                                human_message,
-                                source="human",
-                                output=False,
-                            )
-                            if is_stop_response(human_response):
-                                human_stopped = True
+                            if getattr(self.human_interaction, "enabled", True):
+                                human_response = await self.ask_human(
+                                    question=(
+                                        f"The command `{result['cmd']}` could not access an expected "
+                                        "file or artifact.\n\n"
+                                        f"Command output:\n{result['result'][-2000:]}\n\n"
+                                        "Provide the correct path, copy the file to the Kali machine, "
+                                        "or explain how to obtain it. Reply 'stop' to end the run."
+                                    ),
+                                    reason="An SSH command reported that an expected file or artifact is unavailable.",
+                                )
+                                human_message = {
+                                    "role": "user",
+                                    "content": f"Human guidance: {human_response}",
+                                }
+                                history.append(human_message)
+                                self.logger.log_append_to_history(
+                                    human_message,
+                                    source="human",
+                                    output=False,
+                                )
+                                if is_stop_response(human_response):
+                                    human_stopped = True
+                                else:
+                                    no_progress_rounds = 0
+                            else:
+                                self.logger.log_data(
+                                    "executor_autonomous_recovery",
+                                    "Expected artifact was unavailable; continuing without human input.",
+                                    output=True,
+                                )
+                                history.append({
+                                    "role": "user",
+                                    "content": (
+                                        "The expected artifact was unavailable. Continue using available "
+                                        "evidence and do not request human input."
+                                    ),
+                                })
                             break
 
+                if round_progressed:
+                    no_progress_rounds = 0
+                    self.last_task_progressed = True
+                else:
+                    no_progress_rounds += 1
+                if no_progress_rounds >= MAX_NO_PROGRESS_ROUNDS:
+                    self.logger.log_data(
+                        "executor_no_progress",
+                        f"No executable progress after {MAX_NO_PROGRESS_ROUNDS} rounds; stopping task recovery.",
+                        output=True,
+                    )
+                    break
                 if human_stopped:
                     break
             else:
@@ -404,6 +458,14 @@ class Executor:
 
                     self.logger.console.log(str(response_message))
                     self.logger.console.log("Empty response from executor LLM.. retrying")
+                    no_progress_rounds += 1
+                    if no_progress_rounds >= MAX_NO_PROGRESS_ROUNDS:
+                        self.logger.log_data(
+                            "executor_no_progress",
+                            f"No executable progress after {MAX_NO_PROGRESS_ROUNDS} rounds; stopping task recovery.",
+                            output=True,
+                        )
+                        break
                 else:
                     summary = response_message.content
                     break

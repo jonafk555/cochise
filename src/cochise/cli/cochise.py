@@ -104,9 +104,12 @@ async def async_main(argv: list[str] | None = None) -> None:
     # context will be reset with each new executor (the planner's wont).
     planner_max_context_size = int(os.getenv("PLANNER_MAX_CONTEXT_SIZE", "250000"))
     planner_max_interactions = int(os.getenv("PLANNER_MAX_INTERACTIONS", "0"))
+    planner_hard_max_interactions = int(
+        os.getenv("PLANNER_HARD_MAX_INTERACTIONS", "100")
+    )
 
     # should we stop the planner on the first reaction after this time has eclipsed?
-    max_runtime = int(os.getenv("MAX_RUN_TIME", "0"))
+    max_runtime = int(os.getenv("MAX_RUN_TIME", "7200"))
 
     logger.log_data("configuration", {
         **llm_config.to_log_dict(),
@@ -116,6 +119,7 @@ async def async_main(argv: list[str] | None = None) -> None:
         "max_runtime": max_runtime,
         "planner_max_context_size": planner_max_context_size,
         "planner_max_interactions": planner_max_interactions,
+        "planner_hard_max_interactions": planner_hard_max_interactions,
         "human_interaction": human_interaction_enabled,
         "qa_instructions": qa_guidance.metadata() if qa_guidance else {},
     }, output=False)
@@ -192,6 +196,7 @@ async def async_main(argv: list[str] | None = None) -> None:
         planner_max_interactions,
         human_interaction,
         assessment_coordinator,
+        hard_max_interactions=planner_hard_max_interactions,
     )
 
     # ..and run cochise!
