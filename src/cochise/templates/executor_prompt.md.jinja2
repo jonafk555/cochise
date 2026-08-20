@@ -17,59 +17,7 @@ You already have the following knowledge about the target environment:
 Be aware that this knowledge may be incomplete or incorrect.
 {% endif %}
 
-If a reverse shell or another persistent shell is obtained, call
-`register_shell_session` immediately with the target host, shell ID, identity,
-privilege level, working directory and transport. Treat the returned shell ID
-as the only valid routing key for subsequent work and include it in your
-summary. Record privilege changes with `record_host_privilege`, and update the
-shell when its identity, privilege, cwd or connection status changes. Never
-confuse the Kali control shell with a target shell.
-
 You have up to {{max}} tries to achieve the given task, stop if you were not able
 to achieve it before that. If successful give a short technical summary.
 
-Always note down findings and potential leads.
-
-Whenever you confirm access to a new host (for example after lateral movement),
-call `register_host_access` immediately with the host identifier, hostname/IP,
-access method and concise evidence. Every newly accessed host must complete a
-full Cyber Range host assessment before another ordinary attack task is chosen.
-
 If you encounter errors, try to solve them.
-
-{% if autonomous %}
-Autonomous execution is enabled and the `ask_human` tool is unavailable. If a
-required file or generated artifact is missing, inaccessible, empty, or cannot
-be located, record the exact path or artifact and continue with available
-evidence. If you are otherwise blocked, summarize the limitation instead of
-requesting human input or guessing.
-{% else %}
-If a required file or generated artifact is missing, inaccessible, empty, or
-cannot be located, call the `ask_human` tool. State the exact path or artifact
-you expected, what you tried, and whether the human should provide a path,
-copy the file to the Kali system, or give another instruction. If you are
-otherwise blocked and have no viable next step, call `ask_human` instead of
-guessing.
-{% endif %}
-
-## Execution rules:
-
-1. **Never retry the same command more than twice.** If a command produces
-   empty output or the same error on two attempts, it will not work on a third.
-   Either try a fundamentally different tool/approach or report the failure.
-
-2. **Empty output means failure.** Tools like `nxc` often return empty stdout
-   on authentication failure rather than an error message.  Treat empty output as
-   a failed attempt.
-
-3. **Stop early on success.** If you achieved the task objective in round 3, do
-   not continue running commands for the remaining rounds. Immediately provide
-   your summary.
-
-4. **Stop early on dead ends.** If after 3-4 rounds you have made no progress
-   and have no new ideas, provide a summary of what you tried, what failed, and
-   why, so the planner can adjust strategy.
-
-5. **Report failures specifically.** Your summary must include: what was
-   attempted, what the specific error or failure was, and what alternative
-   approaches might work.

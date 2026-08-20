@@ -67,18 +67,32 @@ async def perform_tool_call(id, tool_name, function, args):
 
 TEMPLATE_DIR = pathlib.Path(__file__).parent / "templates"
 PROMPT = (TEMPLATE_DIR / "executor_prompt.md.jinja2").read_text()
+QA_PROMPT = (TEMPLATE_DIR / "qa_executor_prompt.md.jinja2").read_text()
 MAX_ROUNDS:int=25
 HUMAN_RECOVERY_ROUNDS:int=5
 MAX_NO_PROGRESS_ROUNDS:int=3
 
 class ExecutorFactory:
-    def __init__(self, model, api_key, scenario, configured_tools, logger, human_interaction=None):
+    def __init__(
+        self,
+        model,
+        api_key,
+        scenario,
+        configured_tools,
+        logger,
+        human_interaction=None,
+        qa_enabled: bool = False,
+    ):
         self.model = model
         self.api_key = api_key
         self.logger = logger
         self.scenario = scenario
         self.configured_tools = configured_tools
-        self.human_interaction = human_interaction or HumanInteraction(logger.console)
+        self.qa_enabled = qa_enabled
+        self.human_interaction = human_interaction or HumanInteraction(
+            logger.console,
+            enabled=qa_enabled,
+        )
 
     def build(self, system_knowledge):
         return Executor(
@@ -89,6 +103,7 @@ class ExecutorFactory:
             system_knowledge,
             self.logger,
             self.human_interaction,
+            self.qa_enabled,
         )
 
 class Executor:
@@ -102,6 +117,7 @@ class Executor:
         system_knowledge,
         logger,
         human_interaction=None,
+        qa_enabled: bool = False,
     ):
         self.model = model
         self.api_key = api_key
@@ -109,7 +125,11 @@ class Executor:
         self.scenario = scenario
         self.system_knowledge = system_knowledge
         self.configured_tools = configured_tools
-        self.human_interaction = human_interaction or HumanInteraction(logger.console)
+        self.qa_enabled = qa_enabled
+        self.human_interaction = human_interaction or HumanInteraction(
+            logger.console,
+            enabled=qa_enabled,
+        )
         self.last_task_progressed = False
 
     def setLogger(self, logger):
@@ -151,7 +171,7 @@ class Executor:
 
         self.last_task_progressed = False
         self.logger.log_data("executor", "Starting task: " + next_step)
-        prompt = Template(PROMPT).render({
+        prompt = Template(QA_PROMPT if self.qa_enabled else PROMPT).render({
             'next_step': next_step,
             'next_step_context': next_step_context,
             'max': str(MAX_ROUNDS-1),
@@ -169,16 +189,24 @@ class Executor:
         tool_functions = list(self.configured_tools)
         if getattr(self.human_interaction, "enabled", True):
             tool_functions.append(self.ask_human)
-        tool_functions.extend([
-            knowledge.register_host_access,
-            knowledge.add_compromised_account,
-            knowledge.update_compromised_account,
-            knowledge.add_entity_information,
-            knowledge.update_entity_information,
-            knowledge.record_host_privilege,
-            knowledge.register_shell_session,
-            knowledge.update_shell_session,
-        ])
+        if self.qa_enabled:
+            tool_functions.extend([
+                knowledge.register_host_access,
+                knowledge.add_compromised_account,
+                knowledge.update_compromised_account,
+                knowledge.add_entity_information,
+                knowledge.update_entity_information,
+                knowledge.record_host_privilege,
+                knowledge.register_shell_session,
+                knowledge.update_shell_session,
+            ])
+        else:
+            tool_functions.extend([
+                knowledge.add_compromised_account,
+                knowledge.update_compromised_account,
+                knowledge.add_entity_information,
+                knowledge.update_entity_information,
+            ])
         tools = LLMFunctionMapping(tool_functions)
 
         prompt = f"[bold]Task: {next_step}\nCategorization:[/bold] {mitre_attack_tactic}/{mitre_attack_technique}\n\n[bold]Context:[/bold]\n{next_step_context}\n\n[bold]Existing Knowledge:[/bold]\n{self.system_knowledge.get_knowledge()}"
@@ -486,7 +514,7 @@ class Executor:
                 self.api_key,
                 history,
                 operation="executor summary",
-                tools=tools.get_tool_definitions(),
+                tools=tools.get_tool_definitions() if self.qa_enabled else None,
             )
             self.logger.log_llm_call('executor_no_summary', result, costs, duration, output=True)
 

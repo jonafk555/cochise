@@ -24,13 +24,21 @@ Cochise is an autonomous penetration testing framework that uses LLM-driven hier
 The `async_main()` function is the single entry point. It performs setup in a strict sequence:
 
 1. **Load configuration** from `.env` via `dotenv` and resolve an `LLMConfig` from `LLM_PROVIDER`, `LLM_MODEL`, the provider-specific API key, and the local endpoint settings. The legacy `LITELLM_MODEL`/`LITELLM_API_KEY` pair is also supported.
-2. **Validate LLM tool calling** with a small forced healthcheck. Planner, Executor, and assessment workers all depend on function calling.
+2. **Optionally validate LLM tool calling** with a small forced healthcheck. The
+   check is enabled by default only for the optional QA layer.
 3. **Create SSH connection** (`get_ssh_connection_from_env()`) and connect to the target.
-4. **Initialize logger** with a `Rich` console for pretty output and `structlog` for JSON log files under `logs/`. `HUMAN_INTERACTION=0` disables stdin prompts, automatically records blocking assessment overrides, and removes `ask_human` from autonomous LLM tool surfaces.
-5. **Build components:** An `ExecutorFactory` is created with the model, API key, scenario text, the SSH `execute_command` tool, and the logger. A `RangeAssessmentCoordinator` is created with the black-box adapter and optional white-box spec. A `Planner` is created with the factory, assessment coordinator, and configuration limits.
-6. **Start the run** by calling `planner.engage()`. The Planner runs the mandatory global Cyber Range preflight before creating its initial attack plan. `QA_REPORT_PATH` points to a continuously updated Markdown report; it is refreshed after global and host assessments.
+4. **Initialize logger** with a `Rich` console for pretty output and `structlog` for JSON log files under `logs/`. `HUMAN_INTERACTION=0` disables stdin prompts.
+5. **Build components:** An `ExecutorFactory` and `Planner` are always created
+   with the model, scenario text, SSH `execute_command` tool, and logger. A
+   `RangeAssessmentCoordinator` and QA report are created only when
+   `QA_ENABLED=1` or `--qa` is selected.
+6. **Start the run** by calling `planner.engage()`. The default Planner follows
+   the original Cochise flow. When `QA_ENABLED=1` (or `--qa`) is selected, the
+   optional global Cyber Range preflight runs before the initial attack plan and
+   `QA_REPORT_PATH` points to the continuously updated Markdown report.
 
-The scenario text is loaded at import time from `templates/scenario.md` and describes the penetration test objective (Active Directory domain dominance on 192.168.122.0/24).
+The scenario text is loaded at import time from `templates/scenario.md` and
+describes the configured penetration-test objective.
 
 ---
 
@@ -58,7 +66,9 @@ Then enters the main loop (bounded by `max_runtime`):
 
 **Each round:**
 
-1. **Run pending host assessments:** Any newly registered host is assessed before ordinary attack work continues. Blocking results pause for human guidance.
+1. **When QA is enabled, run pending host assessments:** Any newly registered
+   host is assessed before ordinary attack work continues. Blocking results
+   pause for human guidance.
 2. **Check compaction triggers:** If `max_interactions` exceeded or `last_input_tokens >= max_context_size`, call `compact_history()` to summarize and reset the conversation.
 3. **Build a fresh Executor** via `executor_factory.build(self.knowledge)`. Each executor starts with no memory of previous rounds but receives the current knowledge base.
 4. **Register tools** as an `LLMFunctionMapping`:
@@ -67,7 +77,8 @@ Then enters the main loop (bounded by `max_runtime`):
    - `knowledge.update_compromised_account` -- update an existing credential
    - `knowledge.add_entity_information` -- store recon findings
    - `knowledge.update_entity_information` -- update recon findings
-   - `knowledge.register_host_access` -- mark a newly accessed host for mandatory assessment
+   - `knowledge.register_host_access` -- mark a newly accessed host for QA
+     assessment (QA mode only)
 5. **Call LLM** with `llm_tool_call()`, passing the history and tool definitions. The LLM selects a task and calls the appropriate tool.
 6. **Process tool calls:** For each tool call in the response:
    - Execute the function (e.g., `executor.perform_task(...)` which runs the full executor loop).
@@ -91,7 +102,7 @@ This keeps the context window bounded while preserving strategic state.
 
 **File:** `src/cochise/assessment.py`
 
-The assessment coordinator provides two mandatory gates:
+When enabled, the assessment coordinator provides two QA gates:
 
 1. A global black-box preflight runs from the attacker VM before the initial
    Planner plan. It records interface, route, DNS, and configured network

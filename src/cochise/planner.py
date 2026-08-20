@@ -22,9 +22,10 @@ TEMPLATE_DIR = pathlib.Path(__file__).parent / "templates"
 
 PLANNER_STRUCTURE = (TEMPLATE_DIR / "planner_structure.md").read_text()
 PROMPT = (TEMPLATE_DIR / "planner_prompt.md").read_text()
+QA_PROMPT = (TEMPLATE_DIR / "qa_planner_prompt.md").read_text()
 MAX_AUTONOMOUS_NO_PROGRESS_ROUNDS = 3
 MAX_TOOL_REPAIR_ROUNDS = 3
-DEFAULT_HARD_MAX_INTERACTIONS = 100
+DEFAULT_HARD_MAX_INTERACTIONS = 0
 
 class Planner:
     
@@ -41,6 +42,7 @@ class Planner:
         human_interaction=None,
         assessment_coordinator=None,
         hard_max_interactions: int = DEFAULT_HARD_MAX_INTERACTIONS,
+        qa_enabled: bool = False,
     ):
         self.model = model
         self.model_api_key = model_api_key
@@ -51,8 +53,12 @@ class Planner:
         self.max_context_size = max_context_size
         self.max_interactions = max_interactions
         self.hard_max_interactions = hard_max_interactions
-        self.human_interaction = human_interaction or HumanInteraction(logger.console)
         self.assessment_coordinator = assessment_coordinator
+        self.qa_enabled = bool(qa_enabled or assessment_coordinator is not None)
+        self.human_interaction = human_interaction or HumanInteraction(
+            logger.console,
+            enabled=self.qa_enabled,
+        )
         self.human_stop_requested = False
         self.preflight_complete = False
 
@@ -67,13 +73,19 @@ class Planner:
             self.PLANNER_INITIAL_STRUCTURE = PLANNER_STRUCTURE + "\n\n# Task\n\nProvide the hierarchical task plan as answer. Do not include a title or an appendix."
             self.SCENARIO_AND_STRUCTURE = self.scenario + "\n\n# Task Plan Creation and Evolution\n\n" + PLANNER_STRUCTURE
 
+    def _qa_mode(self) -> bool:
+        """Return whether the optional assessment/tool surface is active."""
+
+        return bool(self.qa_enabled or self.assessment_coordinator is not None)
+
     def _planner_execution_prompt(self) -> str:
         """Return the task-selection contract for the current interaction mode."""
 
-        if getattr(self.human_interaction, "enabled", True):
-            return PROMPT
+        prompt = QA_PROMPT if self._qa_mode() else PROMPT
+        if not self._qa_mode() or getattr(self.human_interaction, "enabled", True):
+            return prompt
         return (
-            PROMPT
+            prompt
             + "\n\nAutonomous execution mode is enabled. Do not call ask_human. "
             "You MUST call perform_task for the most promising executable task; "
             "the worker will handle bounded recovery autonomously."
@@ -82,7 +94,7 @@ class Planner:
     def _planner_tool_choice(self) -> dict[str, object] | None:
         """Require executable work when no human can answer a planner prompt."""
 
-        if getattr(self.human_interaction, "enabled", True):
+        if not self._qa_mode() or getattr(self.human_interaction, "enabled", True):
             return None
         return {
             "type": "function",
@@ -114,8 +126,13 @@ class Planner:
 
     # IDEA: unify with compact_history
     def create_initial_plan(self) -> str:
+        system_context = (
+            self._planner_system_context()
+            if self._qa_mode()
+            else self.scenario
+        )
         tmp_history = [
-            {"role": "system", "content": self._planner_system_context()},
+            {"role": "system", "content": system_context},
             {"role": "user", "content": self.PLANNER_INITIAL_STRUCTURE }
         ]
         self.logger.log_append_to_history(tmp_history, "manual", False)
@@ -143,15 +160,20 @@ class Planner:
             self.model_api_key,
             self.history,
             operation="planner history compaction",
-            tools=self._last_planner_tools,
+            tools=self._last_planner_tools if self._qa_mode() else None,
         )
 
         plan = result["content"]
         self.logger.log_llm_call('compact_history', plan, costs, duration, output=True)
         self.logger.console.print(Panel(plan, title="new plan"))
 
+        system_context = (
+            self._planner_system_context()
+            if self._qa_mode()
+            else self.SCENARIO_AND_STRUCTURE
+        )
         self.history = [
-            { "role": "system", "content": self._planner_system_context()},
+            { "role": "system", "content": system_context},
             { "role": "user", "content": "Create me an initial plan to achieve the overall objective. Break down the overall objective into smaller tasks and subtasks. Do not include generic steps, only very specific ones that are directly relevant for achieving the overall objective. Be concise." },
             { "role": "assistant", "content": f"# Initial Plan\n\n{plan}\n\n\n # Gathered Findings\n\n{self.knowledge.get_knowledge()}" },
             { "role": "user", "content": self._planner_execution_prompt() } # always finish with user prompt
@@ -177,8 +199,9 @@ class Planner:
         tool_functions = [executor.perform_task]
         if getattr(self.human_interaction, "enabled", True):
             tool_functions.append(self.ask_human)
+        if self._qa_mode():
+            tool_functions.append(self.knowledge.register_host_access)
         tool_functions.extend([
-            self.knowledge.register_host_access,
             self.knowledge.add_compromised_account,
             self.knowledge.update_compromised_account,
             self.knowledge.add_entity_information,
@@ -353,11 +376,6 @@ class Planner:
         """Engage the planner to select the next task to perform based on the current plan and knowledge. This will be called in a loop until the overall objective is achieved.
         """
 
-        if self.assessment_coordinator is None:
-            raise RuntimeError(
-                "Cyber Range assessment coordinator is required before the Planner can engage."
-            )
-
         # used for stopping and compaction logic
         interaction_counter = 0 # this is currently a round-counter actually
         last_input_tokens = 0
@@ -445,29 +463,30 @@ class Planner:
                     executor,
                     tool_mapping,
                 )
-                if progressed:
-                    no_progress_rounds = 0
-                    tool_repair_rounds = 0
-                else:
-                    no_progress_rounds += 1
-                    tool_repair_rounds = tool_repair_rounds + 1 if errors else 0
-                if tool_repair_rounds >= MAX_TOOL_REPAIR_ROUNDS:
-                    self.logger.log_data(
-                        "completed",
-                        "Planner stopped after repeated tool-call repair failures.",
-                        output=True,
-                    )
-                    human_stopped = True
-                    break
-                if no_progress_rounds >= MAX_AUTONOMOUS_NO_PROGRESS_ROUNDS:
-                    self.logger.log_data(
-                        "completed",
-                        "Planner stopped after repeated rounds without executable progress.",
-                        output=True,
-                    )
-                    human_stopped = True
-                    break
-                if self.human_stop_requested:
+                if self._qa_mode():
+                    if progressed:
+                        no_progress_rounds = 0
+                        tool_repair_rounds = 0
+                    else:
+                        no_progress_rounds += 1
+                        tool_repair_rounds = tool_repair_rounds + 1 if errors else 0
+                    if tool_repair_rounds >= MAX_TOOL_REPAIR_ROUNDS:
+                        self.logger.log_data(
+                            "completed",
+                            "Planner stopped after repeated tool-call repair failures.",
+                            output=True,
+                        )
+                        human_stopped = True
+                        break
+                    if no_progress_rounds >= MAX_AUTONOMOUS_NO_PROGRESS_ROUNDS:
+                        self.logger.log_data(
+                            "completed",
+                            "Planner stopped after repeated rounds without executable progress.",
+                            output=True,
+                        )
+                        human_stopped = True
+                        break
+                if self._qa_mode() and self.human_stop_requested:
                     human_stopped = True
                     break
             else:
@@ -477,42 +496,8 @@ class Planner:
                 # because the planner should only select a task to perform and call
                 # the respective tool for that. You might want to check if the LLM is able
                 # to call tools correctly.
-                non_tool_response_counter += 1
-                no_progress_rounds += 1
                 self.logger.console.print(Panel(Pretty(response_message.content), title="LLM Response Content"))
-                if (
-                    no_progress_rounds >= MAX_AUTONOMOUS_NO_PROGRESS_ROUNDS
-                    and not getattr(self.human_interaction, "enabled", True)
-                ):
-                    self.logger.log_data(
-                        "completed",
-                        "Planner stopped after repeated non-tool responses in autonomous mode.",
-                        output=True,
-                    )
-                    human_stopped = True
-                    break
-                if non_tool_response_counter >= 2:
-                    if getattr(self.human_interaction, "enabled", True):
-                        human_response = await self.ask_human(
-                            question=(
-                                "The planner has not produced an executable task for two rounds. "
-                                "Provide missing target/file information or tell it how to proceed. "
-                                "Reply 'stop' to end the run."
-                            ),
-                            reason="The planner is stalled and returned text instead of a tool call.",
-                        )
-                        msg = {
-                            "role": "user",
-                            "content": f"Human guidance: {human_response}",
-                        }
-                        self.logger.log_append_to_history(msg, "human", output=False)
-                        self.history.append(msg)
-                        non_tool_response_counter = 0
-                        no_progress_rounds = 0
-                        if is_stop_response(human_response):
-                            human_stopped = True
-                            break
-                else:
+                if not self._qa_mode():
                     msg = {
                         "role": "user",
                         "content": (
@@ -522,6 +507,51 @@ class Planner:
                     }
                     self.logger.log_append_to_history(msg, "manual", output=True)
                     self.history.append(msg)
+                else:
+                    non_tool_response_counter += 1
+                    no_progress_rounds += 1
+                    if (
+                        no_progress_rounds >= MAX_AUTONOMOUS_NO_PROGRESS_ROUNDS
+                        and not getattr(self.human_interaction, "enabled", True)
+                    ):
+                        self.logger.log_data(
+                            "completed",
+                            "Planner stopped after repeated non-tool responses in autonomous mode.",
+                            output=True,
+                        )
+                        human_stopped = True
+                        break
+                    if non_tool_response_counter >= 2:
+                        if getattr(self.human_interaction, "enabled", True):
+                            human_response = await self.ask_human(
+                                question=(
+                                    "The planner has not produced an executable task for two rounds. "
+                                    "Provide missing target/file information or tell it how to proceed. "
+                                    "Reply 'stop' to end the run."
+                                ),
+                                reason="The planner is stalled and returned text instead of a tool call.",
+                            )
+                            msg = {
+                                "role": "user",
+                                "content": f"Human guidance: {human_response}",
+                            }
+                            self.logger.log_append_to_history(msg, "human", output=False)
+                            self.history.append(msg)
+                            non_tool_response_counter = 0
+                            no_progress_rounds = 0
+                            if is_stop_response(human_response):
+                                human_stopped = True
+                                break
+                    else:
+                        msg = {
+                            "role": "user",
+                            "content": (
+                                "You MUST call the perform_task tool. Select the most promising "
+                                "incomplete task from the plan and call it now."
+                            ),
+                        }
+                        self.logger.log_append_to_history(msg, "manual", output=True)
+                        self.history.append(msg)
             
             interaction_counter += 1
         

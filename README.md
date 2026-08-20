@@ -2,19 +2,20 @@
 
 > **Origin:** This repository started from the upstream
 > [Cochise research prototype](https://github.com/andreashappe/cochise) by
-> Andreas Happe. It keeps the original Planner/Executor and tool-calling core,
-> and extends it with Cyber Range assessment, semantic QA guidance, victim-side
-> adapters, live QA reporting, and artifact aggregation.
+> Andreas Happe. The default run keeps the original Planner/Executor and
+> tool-calling path. Cyber Range assessment, semantic QA guidance, victim-side
+> adapters, live QA reporting, and artifact aggregation are optional.
 >
 > **起源：** 本專案一開始源自 Andreas Happe 的 upstream Cochise 研究原型；
-> 目前 fork 保留原本的 Planner/Executor 與 tool-calling 核心，再擴充
-> Cyber Range QA、語意化 spec、victim adapter、即時報告與 artifact 彙整。
+> 目前 fork 的預設執行保留原本的 Planner/Executor 與 tool-calling 路徑；
+> Cyber Range QA、語意化 spec、victim adapter、即時報告與 artifact 彙整需明確啟用。
 
 This project uses an LLM to plan and execute authorized penetration-testing
 work in an isolated Cyber Range. The LLM decides how to interpret the scenario,
 select the next task, call tools, and evaluate evidence. Python provides the
-fixed infrastructure: SSH, tool schemas, state management, assessment gates,
-report rendering, artifact indexing, and bounded retries.
+fixed Planner/Executor infrastructure: SSH, tool schemas, state management,
+and bounded retries. Assessment gates, report rendering, and artifact indexing
+belong to the optional QA layer.
 
 Use this software only against systems that you own or are explicitly authorized
 to test. Never point it at production, public infrastructure, or a third-party
@@ -30,10 +31,9 @@ network without written permission.
 - SSH command execution on a Linux attacker/Kali VM.
 - LiteLLM provider mapping for OpenAI, Anthropic/Claude, Gemini, Ollama, and
   OpenAI-compatible local servers.
-- A mandatory global Cyber Range preflight before the Planner starts ordinary
-  attack work.
-- Black-box assessment by default, with optional white-box assessment through
-  `RANGE_SPEC_PATH`.
+- An optional global Cyber Range preflight and per-host QA layer. It is not
+  loaded by the default run.
+- Black-box or white-box assessment when `--qa`/`QA_ENABLED=1` is enabled.
 - Human-authored QA intent through `--qa-instructions`; the input can be
   Markdown, YAML, JSON, plain text, or natural language. The file is kept as
   semantic context and is never executed as a script.
@@ -71,9 +71,9 @@ adapter, QA evidence is attacker-side evidence collected from Kali.
                     | cochise CLI         |
                     | LLMConfig + SSH     |
                     +----------+----------+
-                               |
-                 global range preflight / QA report
-                               |
+                              |
+                 optional QA layer (explicitly enabled)
+                              |
         +----------------------+----------------------+
         |                                             |
         v                                             v
@@ -117,8 +117,8 @@ compacts the history into a new plan and a bounded knowledge context.
 
 ### Assessment and gates
 
-`RangeAssessmentCoordinator` runs beside the original Planner/Executor flow; it
-does not replace the attack executor:
+When QA is explicitly enabled, `RangeAssessmentCoordinator` runs beside the
+original Planner/Executor flow; it does not replace the attack executor:
 
 1. A global preflight runs from the attacker VM before the initial Planner plan.
 2. Structured hosts in a white-box spec can be registered as pending QA hosts.
@@ -136,20 +136,50 @@ the LLM workflow through `register_host_access`.
 > **中文摘要：** QA assessment 是原本攻擊流程旁邊的 gate，不取代 Planner/
 > Executor。global discovery 後，新主機要先完成 host QA 才能繼續一般攻擊。
 
+### Execution modes: core versus QA
+
+Entering QA mode does **not** switch to a second or legacy execution
+architecture. Both modes use the same Cochise core:
+
+```text
+Planner (persistent) -> Executor (per task) -> tool calling -> SSH/Kali
+```
+
+The difference is whether the optional QA control layer is active:
+
+| Mode | Command | Additional behavior |
+|---|---|---|
+| Core/default | `uv run cochise` | Original Planner/Executor and tool-calling flow only. No QA preflight, host gates, QA report, or QA-specific tool surface. |
+| QA-enabled | `uv run cochise --qa` | The same core plus optional healthcheck, range preflight, semantic assessment, host-QA gates, report, and artifact index. |
+| QA with human intent | `uv run cochise --qa-instructions specs/custom-qa.md` | QA-enabled mode plus bounded human-authored semantic guidance. |
+
+QA mode therefore adds behavior around the original attack executor; it does
+not replace the Planner, create a separate attack engine, or force Python to
+decide the attack sequence. The LLM still interprets the scenario/spec,
+decomposes work, chooses tools, and evaluates evidence. Python remains the
+transport, state, retry, reporting, and safety boundary.
+
+`scenario.md` is still supplied as system context in both modes. A white-box
+environment spec and `--qa-instructions` add semantic QA context; they do not
+replace the scenario or directly execute its text. Because the checked-in
+scenario remains AD-oriented, custom QA guidance alone does not change the
+ordinary attack objective. Change `src/cochise/templates/scenario.md` when
+that objective must change.
+
+> **中文摘要：** QA mode 是「原本 Planner/Executor 核心 + QA sidecar」，不是
+> 切換成另一套舊架構。`scenario.md` 在兩種模式都會載入；spec 與 custom QA
+> 只增加語意，不會自動取代 AD scenario。
+
 ## Run lifecycle
 
-1. The CLI loads `.env` from the project directory. It uses
-   `load_dotenv(override=True)`, so values in `.env` override inherited shell
-   variables.
-2. It resolves the LLM configuration, optionally runs the tool-calling
-   healthcheck, connects to SSH, and initializes the QA report and adapters.
-3. The global black-box or white-box preflight collects initial range evidence.
-4. The Planner creates an initial plan and starts selecting executable tasks.
-5. The Executor runs SSH tools, records findings, and returns knowledge.
-6. Newly accessed hosts are assessed before the Planner selects another normal
-   attack task. Victim-side evidence is kept separate when a victim adapter is
-   configured.
-7. The report is finalized as `completed` or `failed` when the run ends.
+1. The CLI loads `.env` from the project directory; explicit shell variables
+   retain precedence.
+2. It resolves the LLM configuration, connects to SSH, and starts the original
+   Planner/Executor tool-calling flow.
+3. Only when `--qa` or `QA_ENABLED=1` is set does it initialize the QA report,
+   adapters, global preflight, and host assessments.
+4. The report is finalized as `completed` or `failed` when an enabled QA run
+   ends.
 
 ## Installation
 
@@ -197,13 +227,11 @@ TARGET_HOST=192.168.56.100
 TARGET_USERNAME=root
 TARGET_PASSWORD=kali
 
-# Explicit black-box mode
-RANGE_MODE=blackbox
-RANGE_NETWORKS=192.168.56.0/24
-
-# Optional behavior
-LLM_HEALTHCHECK=1
-HUMAN_INTERACTION=1
+# The default run is the original Planner/Executor flow.
+# Enable the optional QA layer only when needed:
+# QA_ENABLED=1
+# RANGE_MODE=blackbox
+# RANGE_NETWORKS=192.168.56.0/24
 ```
 
 ### LLM provider examples
@@ -284,13 +312,14 @@ backend uses `local` as its default LiteLLM key when none is supplied.
 
 | Variable | Default | Description |
 |---|---:|---|
-| `MAX_RUN_TIME` | `7200` | Planner runtime in seconds; `0` means unlimited. |
+| `QA_ENABLED` | `0` | Enable the optional Cyber Range QA/report/adapter layer. |
+| `MAX_RUN_TIME` | `0` | Planner runtime in seconds; QA mode defaults to `7200`; `0` means unlimited. |
 | `PLANNER_MAX_CONTEXT_SIZE` | `250000` | Planner prompt-token threshold for history compaction; `0` disables this trigger. |
 | `PLANNER_MAX_INTERACTIONS` | `0` | Planner-round threshold for compaction; `0` disables this trigger. |
-| `PLANNER_HARD_MAX_INTERACTIONS` | `100` | Hard Planner interaction cap; `0` means unlimited. |
-| `LLM_HEALTHCHECK` | `1` | Force a tool-calling check before the range preflight. |
-| `HUMAN_INTERACTION` | `1` | `1` enables `ask_human`; `0` disables stdin and records automatic gate overrides. |
-| `RANGE_MODE` | white-box when a spec exists, otherwise black-box | Must be `blackbox` or `whitebox`. |
+| `PLANNER_HARD_MAX_INTERACTIONS` | `0` | Hard Planner interaction cap; QA mode defaults to `100`; `0` means unlimited. |
+| `LLM_HEALTHCHECK` | `0` | Optional forced tool-calling check in QA mode; QA defaults to `1`. |
+| `HUMAN_INTERACTION` | `0` | `1` enables `ask_human` in QA mode; QA defaults to `1`. |
+| `RANGE_MODE` | unset | Read only when QA is enabled; must be `blackbox` or `whitebox`. |
 | `RANGE_SPEC_PATH` | unset | White-box spec path; required when `RANGE_MODE=whitebox`. |
 | `RANGE_NETWORKS` | unset | Attacker-side probe CIDRs, separated by commas or semicolons. |
 | `RANGE_CONTROL_PLANE_MODULE` | unset | Management/control-plane adapter in `module:factory` form. |
@@ -298,14 +327,12 @@ backend uses `local` as its default LiteLLM key when none is supplied.
 | `QA_REPORT_PATH` | `logs/qa-report.md` | Continuously updated Markdown QA report. |
 | `QA_ARTIFACT_DIR` | `<report directory>/artifacts` | Directory containing `artifact-manifest.jsonl`. |
 
-Because `.env` is loaded with `override=True`, a value in `.env` wins over an
-inherited shell value. If `.env` contains `RANGE_MODE=blackbox`, running
-`RANGE_MODE=whitebox uv run cochise` may still result in black-box mode. Edit
-`.env` or remove the conflicting variable when switching modes.
+QA variables are ignored by the default run unless `QA_ENABLED=1`, `--qa`, or
+`--qa-instructions` is supplied. Explicit shell variables retain precedence over
+values loaded from `.env`.
 
-> **中文摘要：** `.env` 是目前執行設定的權威來源，會覆寫 shell 環境變數；
-> `TARGET_HOST` 是 Kali，不是 AD 或 victim。所有 LLM、Planner、QA、report
-> 與 adapter 參數均列於上表。
+> **中文摘要：** 預設不啟用 QA；使用 `QA_ENABLED=1` 或 `--qa` 才會載入
+> preflight、report、adapter 與 host assessment。shell 設定優先於 `.env`。
 
 ## Command-line usage
 
@@ -313,6 +340,7 @@ inherited shell value. If `.env` contains `RANGE_MODE=blackbox`, running
 
 ```text
 uv run cochise [--qa-instructions PATH]
+               [--qa]
                [--qa-file PATH]
                [--qa-guidance PATH]
                [--human-qa PATH]
@@ -327,13 +355,18 @@ checks apply.
 ```bash
 uv run cochise --help
 uv run cochise
+uv run cochise --qa
 uv run cochise --qa-instructions specs/human-qa.md
 ```
 
+`--qa` explicitly enables the optional QA layer. `--qa-instructions` also
+enables it and supplies additional human-authored semantic QA intent.
+
 `RANGE_SPEC_PATH` is not a positional argument. To combine a white-box spec
-with human QA guidance, set the spec in `.env` and pass the guidance file:
+with human QA guidance, enable QA, set the spec in `.env`, and pass the guidance file:
 
 ```dotenv
+QA_ENABLED=1
 RANGE_MODE=whitebox
 RANGE_SPEC_PATH=specs/environment.md
 ```
@@ -448,7 +481,7 @@ description to expectations; it does not treat the document as a command list.
 
 ## Cyber Range QA
 
-### Black-box mode (default)
+### Black-box mode (QA default)
 
 Without a white-box spec, the global adapter runs these commands from Kali:
 
@@ -640,8 +673,8 @@ interpretation within the available tool and safety boundaries.
 
 ## Human interaction and unattended mode
 
-With `HUMAN_INTERACTION=1` (the default), Planner, Executor, and Host QA may
-call `ask_human` when:
+With `HUMAN_INTERACTION=1`, Planner, Executor, and enabled Host QA may call
+`ask_human` when:
 
 - an expected file or artifact is missing;
 - a blocking global or host assessment needs correction or an explicit stop;
@@ -712,19 +745,21 @@ test -r "$PWD/specs/environment.md"
 Then set an absolute or correct relative path in `.env`:
 
 ```dotenv
+QA_ENABLED=1
 RANGE_MODE=whitebox
 RANGE_SPEC_PATH=/absolute/path/to/specs/environment.md
 ```
 
-White-box mode without `RANGE_SPEC_PATH` stops with a configuration error. An
-empty file is rejected by the QA guidance loader. An empty or malformed range
-spec is retained as raw text so the semantic worker can report the ambiguity;
-the loader does not invent a topology.
+When QA is enabled, white-box mode without `RANGE_SPEC_PATH` stops with a
+configuration error. An empty file is rejected by the QA guidance loader. An
+empty or malformed range spec is retained as raw text so the semantic worker can
+report the ambiguity; the loader does not invent a topology.
 
 ### QA still follows the AD scenario
 
-`scenario.md` is the system context for Planner, Executor, and Assessment. The
-checked-in scenario is AD-oriented. `--qa-instructions` adds QA intent; it does
+`scenario.md` is the system context for Planner and Executor. The checked-in
+scenario is AD-oriented. When QA is enabled, the assessment worker receives the
+same scenario plus the range spec and any `--qa-instructions`; these inputs do
 not replace the scenario. Change
 `src/cochise/templates/scenario.md` when the ordinary attack objective must be
 changed.
@@ -738,8 +773,8 @@ path that reaches the host and registers access.
 
 ### The run is slow or produces many LLM calls
 
-Check whether the healthcheck, global/host QA, Planner compaction, human
-recovery, and retry settings are enabled. Bound the run with `MAX_RUN_TIME`,
+First check whether `QA_ENABLED`, the healthcheck, global/host QA, Planner
+compaction, human recovery, and retry settings are enabled. Bound the run with `MAX_RUN_TIME`,
 `PLANNER_MAX_CONTEXT_SIZE`, and `PLANNER_HARD_MAX_INTERACTIONS`. Use the JSON
 logs and analysis commands to inspect prompt tokens, cached tokens, duration,
 and cost. `LLM_TIMEOUT_SECONDS` is not the SSH timeout; SSH remains 600 seconds.

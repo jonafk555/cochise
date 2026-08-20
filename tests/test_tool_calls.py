@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from cochise.assessment import AssessmentResult
 from cochise.common import LLMFunctionMapping, parse_tool_call
+from cochise.executor import ExecutorFactory
 from cochise.knowledge import Knowledge
 from cochise.planner import Planner
 
@@ -74,6 +75,113 @@ def _call(call_id, name, arguments):
 
 
 class ToolCallTests(unittest.TestCase):
+    def test_default_planner_does_not_require_assessment_coordinator(self):
+        async def scenario():
+            logger = _Logger()
+            interaction = SimpleNamespace(enabled=False)
+            planner = Planner(
+                "model",
+                None,
+                "scenario",
+                None,
+                logger,
+                human_interaction=interaction,
+                hard_max_interactions=1,
+            )
+
+            class StoppingExecutor(_Executor):
+                async def perform_task(
+                    self,
+                    next_step: str,
+                    next_step_context: str,
+                    mitre_attack_tactic: str,
+                    mitre_attack_technique: str,
+                ):
+                    planner.human_stop_requested = True
+                    return "task complete", Knowledge(logger)
+
+            class Factory:
+                def build(self, knowledge):
+                    return StoppingExecutor()
+
+            planner.executor_factory = Factory()
+            planner.create_initial_plan = lambda: "1.1 Execute the first task"
+            response = SimpleNamespace(
+                role="assistant",
+                content=None,
+                tool_calls=[
+                    _call(
+                        "call-task",
+                        "perform_task",
+                        (
+                            '{"next_step":"execute first task",'
+                            '"next_step_context":"target context",'
+                            '"mitre_attack_tactic":"Discovery",'
+                            '"mitre_attack_technique":"Network Service Scanning"}'
+                        ),
+                    ),
+                ],
+            )
+
+            with patch(
+                "cochise.planner.llm_tool_call",
+                return_value=(response, {"prompt_tokens": 1}, 0.01),
+            ) as llm_call:
+                await planner.engage()
+
+            self.assertEqual(llm_call.call_count, 1)
+            self.assertIsNone(llm_call.call_args.kwargs["tool_choice"])
+
+        asyncio.run(scenario())
+
+    def test_executor_tool_surface_is_original_by_default_and_extended_for_qa(self):
+        async def run_executor(qa_enabled):
+            logger = _Logger()
+            factory = ExecutorFactory(
+                "model",
+                None,
+                "scenario",
+                [],
+                logger,
+                human_interaction=SimpleNamespace(enabled=False),
+                qa_enabled=qa_enabled,
+            )
+            executor = factory.build(Knowledge(logger))
+            response = SimpleNamespace(
+                role="assistant",
+                content="done",
+                tool_calls=[],
+            )
+            with patch(
+                "cochise.executor.llm_tool_call",
+                return_value=(response, {"prompt_tokens": 1}, 0.01),
+            ) as llm_call:
+                await executor.perform_task(
+                    "scan target",
+                    "target context",
+                    "Discovery",
+                    "Network Service Scanning",
+                )
+            return [
+                item["function"]["name"]
+                for item in llm_call.call_args.args[2].get_tool_definitions()
+            ]
+
+        default_names = asyncio.run(run_executor(False))
+        qa_names = asyncio.run(run_executor(True))
+
+        self.assertEqual(
+            default_names,
+            [
+                "add_compromised_account",
+                "update_compromised_account",
+                "add_entity_information",
+                "update_entity_information",
+            ],
+        )
+        self.assertIn("register_shell_session", qa_names)
+        self.assertIn("record_host_privilege", qa_names)
+
     def test_parse_tool_call_rejects_malformed_arguments(self):
         name, arguments, error = parse_tool_call(_call("call-1", "perform_task", "{"))
 
@@ -90,12 +198,44 @@ class ToolCallTests(unittest.TestCase):
             for item in planner._build_tool_mapping(_Executor()).get_tool_definitions()
         ]
 
+        self.assertEqual(
+            names[:3],
+            ["perform_task", "add_compromised_account", "update_compromised_account"],
+        )
+        self.assertNotIn("ask_human", names)
+        self.assertNotIn("register_host_access", names)
+
+    def test_qa_planner_tool_surface_is_opt_in(self):
+        logger = _Logger()
+        planner = Planner(
+            "model",
+            None,
+            "scenario",
+            None,
+            logger,
+            assessment_coordinator=object(),
+            qa_enabled=True,
+        )
+
+        names = [
+            item["function"]["name"]
+            for item in planner._build_tool_mapping(_Executor()).get_tool_definitions()
+        ]
+
         self.assertEqual(names[:3], ["perform_task", "ask_human", "register_host_access"])
 
     def test_autonomous_planner_requires_perform_task(self):
         logger = _Logger()
         interaction = SimpleNamespace(enabled=False)
-        planner = Planner("model", None, "scenario", None, logger, human_interaction=interaction)
+        planner = Planner(
+            "model",
+            None,
+            "scenario",
+            None,
+            logger,
+            human_interaction=interaction,
+            qa_enabled=True,
+        )
 
         self.assertEqual(
             planner._planner_tool_choice(),
@@ -106,7 +246,15 @@ class ToolCallTests(unittest.TestCase):
     def test_autonomous_planner_tool_surface_excludes_ask_human(self):
         logger = _Logger()
         interaction = SimpleNamespace(enabled=False)
-        planner = Planner("model", None, "scenario", None, logger, human_interaction=interaction)
+        planner = Planner(
+            "model",
+            None,
+            "scenario",
+            None,
+            logger,
+            human_interaction=interaction,
+            qa_enabled=True,
+        )
 
         names = [
             item["function"]["name"]
