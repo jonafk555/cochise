@@ -23,8 +23,8 @@ class LLMCallError(RuntimeError):
             "tool" in cause_text or "function" in cause_text
         ):
             hint = (
-                "Check the model's tool-calling API compatibility and set "
-                "LLM_REASONING_EFFORT=none for Chat Completions."
+                "The Chat adapter must not forward reasoning_effort with tools; "
+                "check the configured LiteLLM transport and model compatibility."
             )
         elif any(
             marker in cause_text
@@ -131,11 +131,19 @@ def _is_openai_tool_reasoning_model(model: str | LLMConfig) -> bool:
     return major >= 4
 
 
-def _tool_call_compatibility_kwargs(model: str | LLMConfig) -> dict[str, str]:
-    """Return provider parameters required for tool calls to remain usable."""
+def _validate_tool_call_reasoning_effort(model: str | LLMConfig) -> None:
+    """Validate GPT-5 tool-call configuration without triggering LiteLLM bridge mode.
+
+    Cochise currently uses LiteLLM's Chat Completions response contract
+    (``response.choices[0].message``).  Passing ``reasoning_effort`` to
+    ``litellm.completion`` can make LiteLLM silently switch to Responses, while
+    the rest of Cochise still sends Chat-shaped tool choices and history.  Keep
+    validation here, but leave the parameter out until an explicit Responses
+    adapter is available.
+    """
 
     if not _is_openai_tool_reasoning_model(model):
-        return {}
+        return
 
     configured = _env_first("LLM_REASONING_EFFORT")
     if configured:
@@ -145,41 +153,6 @@ def _tool_call_compatibility_kwargs(model: str | LLMConfig) -> dict[str, str]:
             raise ValueError(
                 f"LLM_REASONING_EFFORT must be one of {allowed}"
             )
-        return {"reasoning_effort": configured}
-
-    return {"reasoning_effort": "none"}
-
-
-def _tool_choice_for_litellm_bridge(
-    model: str | LLMConfig,
-    tool_choice: dict[str, Any] | str,
-    *,
-    has_tools: bool,
-    compatibility_kwargs: dict[str, str],
-) -> dict[str, Any] | str:
-    """Use the tool-choice shape expected by LiteLLM's Responses bridge.
-
-    Cochise's internal tool protocol follows Chat Completions.  LiteLLM
-    1.83.0 converts GPT-5.4+ tool requests to Responses when
-    ``reasoning_effort`` is present, but it does not convert a named
-    ``tool_choice``.  Convert only in that bridge case; ordinary Chat
-    Completions providers must retain the nested function shape.
-    """
-
-    if (
-        not has_tools
-        or not compatibility_kwargs
-        or not _is_openai_tool_reasoning_model(model)
-        or not isinstance(tool_choice, dict)
-        or tool_choice.get("type") != "function"
-    ):
-        return tool_choice
-
-    function = tool_choice.get("function")
-    if not isinstance(function, dict) or not function.get("name"):
-        return tool_choice
-
-    return {"type": "function", "name": function["name"]}
 
 
 def _env_first(*names: str) -> str | None:
@@ -610,21 +583,15 @@ def llm_tool_call(
 ):
 
     tik = datetime.datetime.now()
+    _validate_tool_call_reasoning_effort(model)
     tool_definitions = tools.get_tool_definitions()
-    compatibility_kwargs = _tool_call_compatibility_kwargs(model)
     completion_kwargs = {
         "messages": messages,
         "tools": tool_definitions,
         **_completion_kwargs(model, api_key),
-        **compatibility_kwargs,
     }
     if tool_choice is not None:
-        completion_kwargs["tool_choice"] = _tool_choice_for_litellm_bridge(
-            model,
-            tool_choice,
-            has_tools=bool(tool_definitions),
-            compatibility_kwargs=compatibility_kwargs,
-        )
+        completion_kwargs["tool_choice"] = tool_choice
     response = _completion_with_retry(completion_kwargs, operation=operation)
     tok = datetime.datetime.now()
 
@@ -718,8 +685,8 @@ def llm_call(
         **_completion_kwargs(model, api_key),
     }
     if tools is not None:
+        _validate_tool_call_reasoning_effort(model)
         completion_kwargs["tools"] = tools
-        completion_kwargs.update(_tool_call_compatibility_kwargs(model))
     response = _completion_with_retry(
         completion_kwargs,
         operation=operation,

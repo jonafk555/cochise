@@ -311,7 +311,7 @@ model, API key, and endpoint consistent across interactive shells and `uv run`.
 | `LOCAL_LLM_BACKEND` | `ollama` | `ollama` or `openai-compatible`. |
 | `LOCAL_LLM_BASE_URL` | backend-dependent | Ollama defaults to `http://127.0.0.1:11434`; OpenAI-compatible defaults to `http://127.0.0.1:1234/v1`. |
 | `LOCAL_LLM_API_KEY` | unset | Local key; `OLLAMA_API_KEY` is also accepted. |
-| `LLM_REASONING_EFFORT` | `none` for GPT-5.4+ tool calls | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `default`. |
+| `LLM_REASONING_EFFORT` | unset for Chat tool calls | Validated for GPT-5.4+ models; not forwarded through the current Chat adapter because LiteLLM can silently switch to the Responses API. |
 | `LLM_MAX_RETRIES` | `1` | Maximum retries for transient provider/network errors. |
 | `LLM_RETRY_BACKOFF_SECONDS` | `1` | Exponential backoff base in seconds. |
 | `LLM_TIMEOUT_SECONDS` | unset | LiteLLM request timeout; it does not change the SSH command timeout. |

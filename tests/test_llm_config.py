@@ -1,6 +1,9 @@
 import asyncio
+import json
 import os
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -135,7 +138,7 @@ class LLMConfigTests(unittest.TestCase):
 
         self.assertEqual(captured["tools"], tools)
 
-    def test_gpt_5_4_plus_tool_calls_disable_reasoning_by_default(self):
+    def test_gpt_5_4_plus_tool_calls_keep_chat_transport(self):
         captured = {}
 
         def fake_completion(**kwargs):
@@ -159,9 +162,9 @@ class LLMConfigTests(unittest.TestCase):
                 [{"role": "user", "content": "ping"}],
             )
 
-        self.assertEqual(captured["reasoning_effort"], "none")
+        self.assertNotIn("reasoning_effort", captured)
 
-    def test_tool_reasoning_effort_can_be_overridden(self):
+    def test_tool_reasoning_effort_does_not_trigger_hidden_bridge(self):
         captured = {}
 
         def fake_completion(**kwargs):
@@ -187,7 +190,7 @@ class LLMConfigTests(unittest.TestCase):
                 [{"role": "user", "content": "ping"}],
             )
 
-        self.assertEqual(captured["reasoning_effort"], "low")
+        self.assertNotIn("reasoning_effort", captured)
 
     def test_regular_openai_tool_calls_omit_reasoning_effort(self):
         captured = {}
@@ -237,7 +240,7 @@ class LLMConfigTests(unittest.TestCase):
         self.assertEqual(captured["tool_choice"]["type"], "function")
         self.assertEqual(costs["total_tokens"], 2)
 
-    def test_gpt_5_4_plus_named_tool_choice_uses_responses_bridge_shape(self):
+    def test_gpt_5_4_plus_named_tool_choice_keeps_chat_shape(self):
         captured = {}
 
         def fake_completion(**kwargs):
@@ -273,8 +276,88 @@ class LLMConfigTests(unittest.TestCase):
 
         self.assertEqual(
             captured["tool_choice"],
-            {"type": "function", "name": "_llm_healthcheck_tool"},
+            {
+                "type": "function",
+                "function": {"name": "_llm_healthcheck_tool"},
+            },
         )
+
+    def test_gpt_5_4_plus_healthcheck_sends_valid_chat_request(self):
+        captured = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("content-length", "0"))
+                captured["path"] = self.path
+                captured["body"] = json.loads(self.rfile.read(length))
+                response = {
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": "call-test",
+                                "type": "function",
+                                "function": {
+                                    "name": "_llm_healthcheck_tool",
+                                    "arguments": '{"status":"ok"}',
+                                },
+                            }],
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                }
+                encoded = json.dumps(response).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, *_args):
+                return None
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            config = common.LLMConfig(
+                provider="openai",
+                model="openai/gpt-5.6-luna",
+                api_key="test-key",
+                api_base=f"http://127.0.0.1:{server.server_port}/v1",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "LLM_REASONING_EFFORT": "low",
+                    "LLM_MAX_RETRIES": "0",
+                    "LLM_TIMEOUT_SECONDS": "5",
+                },
+            ):
+                costs, _duration = common.check_llm_tool_calling(config, None)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(captured["path"], "/v1/chat/completions")
+        self.assertEqual(
+            captured["body"]["tool_choice"],
+            {
+                "type": "function",
+                "function": {"name": "_llm_healthcheck_tool"},
+            },
+        )
+        self.assertNotIn("reasoning_effort", captured["body"])
+        self.assertEqual(costs["total_tokens"], 2)
 
     def test_regular_chat_completions_keep_nested_named_tool_choice(self):
         captured = {}
