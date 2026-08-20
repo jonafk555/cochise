@@ -132,6 +132,9 @@ async def async_main(argv: list[str] | None = None) -> None:
         "planner_hard_max_interactions": planner_hard_max_interactions,
         "qa_enabled": qa_enabled,
         "human_interaction": human_interaction_enabled,
+        "excluded_networks": [
+            str(network) for network in getattr(conn, "excluded_networks", ())
+        ],
         "qa_instructions": qa_guidance.metadata() if qa_guidance else {},
     }, output=False)
 
@@ -167,7 +170,10 @@ async def async_main(argv: list[str] | None = None) -> None:
         control_plane = load_control_plane_adapter(
             os.getenv("RANGE_CONTROL_PLANE_MODULE")
         )
-        victim_adapter = load_victim_adapter(os.getenv("RANGE_VICTIM_MODULE"))
+        victim_adapter = load_victim_adapter(
+            os.getenv("RANGE_VICTIM_MODULE"),
+            getattr(conn, "excluded_networks", ()),
+        )
         qa_report_path = os.getenv("QA_REPORT_PATH", "logs/qa-report.md").strip()
         qa_artifact_dir = os.getenv("QA_ARTIFACT_DIR", "").strip() or None
         qa_report = QAReportWriter(
@@ -179,6 +185,10 @@ async def async_main(argv: list[str] | None = None) -> None:
                 "control_plane": bool(control_plane),
                 "victim_validation": bool(victim_adapter),
                 "artifact_dir": qa_artifact_dir or "<report-dir>/artifacts",
+                "excluded_networks": [
+                    str(network)
+                    for network in getattr(conn, "excluded_networks", ())
+                ],
                 "qa_instructions": qa_guidance.metadata() if qa_guidance else {},
             },
         )

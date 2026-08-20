@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import pathlib
 
@@ -62,6 +63,15 @@ class Planner:
         self.human_stop_requested = False
         self.preflight_complete = False
 
+        # QA is a parallel information source.  It must not gate the attack
+        # planner: the planner keeps selecting work while these tasks collect
+        # evidence and update the shared Knowledge store.
+        self._global_preflight_task: asyncio.Task | None = None
+        self._host_assessment_tasks: dict[str, asyncio.Task] = {}
+        self._host_assessment_started: set[str] = set()
+        self._qa_task_errors: dict[str, str] = {}
+        self._last_qa_context: str | None = None
+
         self.history = []
         self.knowledge = Knowledge(self.logger)
         self._last_planner_tools = None
@@ -82,6 +92,18 @@ class Planner:
         """Return the task-selection contract for the current interaction mode."""
 
         prompt = QA_PROMPT if self._qa_mode() else PROMPT
+        if self._qa_mode():
+            prompt += (
+                "\n\n## Parallel QA and attack decision\n\n"
+                "QA workers and attack work run concurrently. Read the current "
+                "assessment context and decide semantically which objective is "
+                "more valuable for the next action: attack validation or QA "
+                "validation. Express that decision in the natural-language "
+                "`next_step` and `next_step_context`, then call `perform_task`. "
+                "Do not wait for a pending QA worker unless the current task "
+                "actually requires its result. Python does not choose between "
+                "QA and attack for you."
+            )
         if not self._qa_mode() or getattr(self.human_interaction, "enabled", True):
             return prompt
         return (
@@ -90,6 +112,124 @@ class Planner:
             "You MUST call perform_task for the most promising executable task; "
             "the worker will handle bounded recovery autonomously."
         )
+
+    def _qa_parallel_context(self) -> str:
+        """Render a small live QA/attack state for the next Planner decision."""
+
+        if not self._qa_mode():
+            return ""
+
+        if self._global_preflight_task is None:
+            global_state = "not_started"
+        elif not self._global_preflight_task.done():
+            global_state = "running_in_background"
+        elif "global" in self._qa_task_errors:
+            global_state = "failed_in_background"
+        else:
+            global_state = "completed"
+
+        host_states: list[str] = []
+        for host_id, host in self.knowledge.hosts.items():
+            task = self._host_assessment_tasks.get(host_id)
+            if task is not None and not task.done():
+                state = "running_in_background"
+            elif host_id in self._qa_task_errors:
+                state = "failed_in_background"
+            else:
+                state = str(host.get("assessment_status") or "not_started")
+            host_states.append(
+                f"- {host_id}: access={host.get('access_status', 'unknown')}, "
+                f"qa={state}"
+            )
+
+        hosts = "\n".join(host_states) if host_states else "- none observed"
+        return (
+            "## Current parallel QA/attack context\n\n"
+            "QA is an asynchronous evidence stream and is not an attack gate. "
+            "Use completed findings, active shell sessions, and observed host "
+            "state as evidence. Pending or failed QA does not by itself stop an "
+            "attack task.\n\n"
+            f"Global QA: {global_state}\n"
+            f"Host QA:\n{hosts}\n"
+            f"Assessment summary: {self.knowledge.get_assessment_summary()}\n"
+        )
+
+    def _append_live_qa_context(self) -> None:
+        """Add changed QA state without replaying the full evidence store."""
+
+        context = self._qa_parallel_context()
+        if not context or context == self._last_qa_context:
+            return
+        message = {"role": "user", "content": context}
+        self.history.append(message)
+        self.logger.log_append_to_history(message, "assessment", output=False)
+        self._last_qa_context = context
+
+    def _poll_background_qa(self) -> None:
+        """Consume completed background workers without turning failures into gates."""
+
+        if self._global_preflight_task is not None and self._global_preflight_task.done():
+            if not self.preflight_complete:
+                try:
+                    result = self._global_preflight_task.result()
+                    self.preflight_complete = True
+                    self.logger.log_data(
+                        "assessment_global_background_complete",
+                        {
+                            "status": getattr(result, "status", "unknown"),
+                            "summary": getattr(result, "summary", ""),
+                        },
+                        output=False,
+                    )
+                except Exception as exc:
+                    self.preflight_complete = True
+                    self._qa_task_errors["global"] = str(exc)
+                    self.logger.log_data(
+                        "assessment_global_background_failed",
+                        {"error": str(exc)},
+                        output=False,
+                    )
+
+        for host_id, task in list(self._host_assessment_tasks.items()):
+            if not task.done():
+                continue
+            try:
+                result = task.result()
+                self.logger.log_data(
+                    "assessment_host_background_complete",
+                    {
+                        "host_id": host_id,
+                        "status": getattr(result, "status", "unknown")
+                        if result is not None
+                        else "already_assessed",
+                    },
+                    output=False,
+                )
+            except Exception as exc:
+                self._qa_task_errors[host_id] = str(exc)
+                self.logger.log_data(
+                    "assessment_host_background_failed",
+                    {"host_id": host_id, "error": str(exc)},
+                    output=False,
+                )
+            del self._host_assessment_tasks[host_id]
+
+    async def _drain_background_qa(self) -> None:
+        """Finish already-started QA workers when the main run is ending."""
+
+        if self._global_preflight_task is not None and not self._global_preflight_task.done():
+            await self._global_preflight_task
+        self._poll_background_qa()
+
+        # The global worker may have registered white-box hosts only after it
+        # completed.  Schedule those workers before producing the final report.
+        await self._run_pending_host_assessments()
+        if self._host_assessment_tasks:
+            await asyncio.gather(
+                *self._host_assessment_tasks.values(),
+                return_exceptions=True,
+            )
+            self._poll_background_qa()
 
     def _planner_tool_choice(self) -> dict[str, object] | None:
         """Require executable work when no human can answer a planner prompt."""
@@ -103,13 +243,15 @@ class Planner:
 
     def _planner_system_context(self) -> str:
         assessment = self.knowledge.get_knowledge()
+        context = self.SCENARIO_AND_STRUCTURE
         if assessment:
-            return (
-                self.SCENARIO_AND_STRUCTURE
-                + "\n\n# Cyber Range Assessment Context\n\n"
+            context += (
+                "\n\n# Cyber Range Assessment Context\n\n"
                 + assessment
             )
-        return self.SCENARIO_AND_STRUCTURE
+        if self._qa_mode():
+            context += "\n\n" + self._qa_parallel_context()
+        return context
 
     async def ask_human(self, question: str, reason: str) -> str:
         """Ask a human for guidance when the planner cannot choose a viable task.
@@ -210,69 +352,40 @@ class Planner:
         return LLMFunctionMapping(tool_functions)
 
     async def _run_global_preflight(self) -> bool:
-        if self.assessment_coordinator is None or self.preflight_complete:
+        if self.assessment_coordinator is None:
             return True
-
-        result = await self.assessment_coordinator.run_global_preflight(self.knowledge)
-        self.preflight_complete = True
-        if not result.is_blocking:
-            return True
-
-        response = await self.ask_human(
-            question=(
-                "The Cyber Range global preflight has blocking findings. "
-                "Review the assessment evidence and provide a correction or reply 'stop' "
-                "to end the run."
-            ),
-            reason="The Cyber Range is not ready according to the global assessment gate.",
-        )
-        if is_stop_response(response):
-            return False
-        if getattr(self.human_interaction, "enabled", True):
-            self.logger.log_data("assessment_global_override", response, output=False)
-        else:
+        if self._global_preflight_task is None:
+            self._global_preflight_task = asyncio.create_task(
+                self.assessment_coordinator.run_global_preflight(self.knowledge)
+            )
             self.logger.log_data(
-                "assessment_global_auto_override",
-                {
-                    "reason": response,
-                    "policy": "HUMAN_INTERACTION=0",
-                },
+                "assessment_global_background_started",
+                "Global QA preflight is running alongside attack planning.",
                 output=False,
             )
+            # Give the adapter a chance to start its asynchronous probes before
+            # the synchronous initial-plan LLM call occupies the event loop.
+            await asyncio.sleep(0)
+        self._poll_background_qa()
         return True
 
     async def _run_pending_host_assessments(self) -> bool:
         if self.assessment_coordinator is None:
             return True
-
+        self._poll_background_qa()
         for host_id in list(self.knowledge.get_pending_hosts()):
-            result = await self.assessment_coordinator.assess_host(host_id, self.knowledge)
-            if result is None:
+            if host_id in self._host_assessment_started:
                 continue
-            self._append_assessment_to_history(result)
-            if not result.is_blocking:
-                continue
-
-            response = await self.ask_human(
-                question=(
-                    f"Host assessment for {host_id} has blocking findings. "
-                    "Provide a correction or reply 'stop' to stop the run."
-                ),
-                reason="A newly accessed host failed the mandatory Cyber Range assessment gate.",
+            self._host_assessment_started.add(host_id)
+            self._host_assessment_tasks[host_id] = asyncio.create_task(
+                self.assessment_coordinator.assess_host(host_id, self.knowledge)
             )
-            if is_stop_response(response):
-                return False
-            autonomous = not getattr(self.human_interaction, "enabled", True)
-            override_reason = response
-            if autonomous:
-                override_reason = (
-                    "Automatically continued because HUMAN_INTERACTION=0; "
-                    "the blocking assessment finding remains recorded."
-                )
-            self.knowledge.override_host_assessment(host_id, override_reason)
             self.logger.log_data(
-                "assessment_host_auto_override" if autonomous else "assessment_host_override",
-                {"host_id": host_id, "reason": override_reason},
+                "assessment_host_background_started",
+                {
+                    "host_id": host_id,
+                    "reason": "LLM receives QA state while attack planning continues.",
+                },
                 output=False,
             )
         return True
@@ -434,6 +547,10 @@ class Planner:
             tool_mapping = self._build_tool_mapping(executor)
             self._last_planner_tools = tool_mapping.get_tool_definitions()
 
+            # The current QA/attack state is natural-language context for the
+            # LLM.  It is deliberately not used by Python to select a branch.
+            self._append_live_qa_context()
+
             self.logger.console.log("Planner: selecting next executable task...")
             with self.logger.console.status("[bold green]llm-call: select next task to perform"):
                 response_message, costs, duration = llm_tool_call(
@@ -554,7 +671,10 @@ class Planner:
                         self.history.append(msg)
             
             interaction_counter += 1
-        
+
+        if self._qa_mode():
+            await self._drain_background_qa()
+
         if human_stopped:
             self.logger.log_data("completed", "Human operator stopped the planner.", output=True)
         elif self.max_runtime != 0 and (datetime.datetime.now() - started).total_seconds() > self.max_runtime:

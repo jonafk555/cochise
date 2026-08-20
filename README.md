@@ -14,15 +14,15 @@ This project uses an LLM to plan and execute authorized penetration-testing
 work in an isolated Cyber Range. The LLM decides how to interpret the scenario,
 select the next task, call tools, and evaluate evidence. Python provides the
 fixed Planner/Executor infrastructure: SSH, tool schemas, state management,
-and bounded retries. Assessment gates, report rendering, and artifact indexing
-belong to the optional QA layer.
+and bounded retries. Background assessment scheduling, report rendering, and
+artifact indexing belong to the optional QA layer.
 
 Use this software only against systems that you own or are explicitly authorized
 to test. Never point it at production, public infrastructure, or a third-party
 network without written permission.
 
 > **中文摘要：** 本專案是以 LLM 操作授權 Cyber Range 的 agent。LLM 負責
-> 語意決策與工具選擇，Python 負責 SSH、狀態、QA gate、報告及安全邊界。
+> 語意決策與工具選擇，Python 負責 SSH、狀態、背景 QA、報告及安全邊界。
 
 ## What this repository currently implements
 
@@ -37,9 +37,9 @@ network without written permission.
 - Human-authored QA intent through `--qa-instructions`; the input can be
   Markdown, YAML, JSON, plain text, or natural language. The file is kept as
   semantic context and is never executed as a script.
-- Per-host QA gates. A host declared by a structured white-box spec, or a host
-  confirmed by `register_host_access`, is assessed before the next ordinary
-  attack task.
+- Per-host QA workers. A host declared by a structured white-box spec, or a host
+  confirmed by `register_host_access`, is assessed in the background while the
+  Planner continues selecting attack or validation work.
 - LLM-selected logical QA roles: common host QA, Windows endpoint QA,
   Windows AD QA, Linux Cyber Range QA, attack validation, victim validation,
   and evidence synthesis.
@@ -58,7 +58,7 @@ AD management, or Linux victim-agent transports. Configure
 adapter, QA evidence is attacker-side evidence collected from Kali.
 
 > **中文摘要：** 目前已實作 Planner/Executor、black-box/white-box QA、每台
-> 主機 gate、Windows/Linux 語意評估、victim/control-plane adapter、即時 QA
+> 背景主機 QA、Windows/Linux 語意評估、victim/control-plane adapter、即時 QA
 > report 與 artifact 去重；Windows/Linux victim transport 需要自行提供 adapter。
 
 ## Architecture
@@ -86,7 +86,7 @@ adapter, QA evidence is attacker-side evidence collected from Kali.
          v                                        v
 +---------------------------+          +-----------------------+
 | Host QA / Assessment      |          | attacker / Kali VM    |
-| LLM worker + gate         |          | nmap, shell, tooling  |
+| LLM worker (background)   |          | nmap, shell, tooling  |
 +-------------+-------------+          +-----------------------+
               |
        optional victim/control-plane adapters
@@ -115,26 +115,29 @@ accounts, entities, hosts, privileges, shell sessions, and findings into the
 shared store. When the Planner context reaches a configured limit, the LLM
 compacts the history into a new plan and a bounded knowledge context.
 
-### Assessment and gates
+### Parallel assessment and attack work
 
 When QA is explicitly enabled, `RangeAssessmentCoordinator` runs beside the
-original Planner/Executor flow; it does not replace the attack executor:
+original Planner/Executor flow; it does not replace or gate the attack executor:
 
-1. A global preflight runs from the attacker VM before the initial Planner plan.
-2. Structured hosts in a white-box spec can be registered as pending QA hosts.
+1. Global discovery starts as a background worker while the Planner creates and
+   executes the attack plan.
+2. Structured hosts in a white-box spec are registered as QA candidates.
 3. The Executor calls `register_host_access` after confirming access to a new
-   host.
-4. Before the next ordinary attack task, the Planner runs the pending host QA.
-5. Blocking findings request human guidance. With `HUMAN_INTERACTION=0`, the
-   finding is retained and an explicit automatic override is recorded; the
-   range is not automatically repaired.
+   host; that registration starts a background Host QA worker.
+4. QA findings, active shells, host access, and worker status are added to the
+   Planner's current natural-language context.
+5. The LLM decides whether the next delegated task should be attack validation
+   or QA validation. Python does not select that branch. Pending or blocking QA
+   findings are recorded and do not automatically stop attack work.
 
 A network address discovered by a global scan is not automatically converted
-into a host QA gate. It must be declared in a structured spec or confirmed by
-the LLM workflow through `register_host_access`.
+into a host QA candidate. It must be declared in a structured spec or confirmed
+by the LLM workflow through `register_host_access`.
 
-> **中文摘要：** QA assessment 是原本攻擊流程旁邊的 gate，不取代 Planner/
-> Executor。global discovery 後，新主機要先完成 host QA 才能繼續一般攻擊。
+> **中文摘要：** QA assessment 與攻擊並行，不再是阻擋攻擊的 gate。LLM 讀取
+> 即時 QA context 後，以自然語言決定下一個要做 QA 或攻擊；Python 只負責
+> 執行、記錄與安全拒絕。
 
 ### Execution modes: core versus QA
 
@@ -149,8 +152,8 @@ The difference is whether the optional QA control layer is active:
 
 | Mode | Command | Additional behavior |
 |---|---|---|
-| Core/default | `uv run cochise` | Original Planner/Executor and tool-calling flow only. No QA preflight, host gates, QA report, or QA-specific tool surface. |
-| QA-enabled | `uv run cochise --qa` | The same core plus optional healthcheck, range preflight, semantic assessment, host-QA gates, report, and artifact index. |
+| Core/default | `uv run cochise` | Original Planner/Executor and tool-calling flow only. No QA preflight, host workers, QA report, or QA-specific tool surface. |
+| QA-enabled | `uv run cochise --qa` | The same core plus optional healthcheck, background range preflight, semantic assessment, host-QA workers, report, and artifact index. |
 | QA with human intent | `uv run cochise --qa-instructions specs/custom-qa.md` | QA-enabled mode plus bounded human-authored semantic guidance. |
 
 QA mode therefore adds behavior around the original attack executor; it does
@@ -177,7 +180,7 @@ that objective must change.
 2. It resolves the LLM configuration, connects to SSH, and starts the original
    Planner/Executor tool-calling flow.
 3. Only when `--qa` or `QA_ENABLED=1` is set does it initialize the QA report,
-   adapters, global preflight, and host assessments.
+   adapters, and background global/host assessments.
 4. The report is finalized as `completed` or `failed` when an enabled QA run
    ends.
 
@@ -232,6 +235,7 @@ TARGET_PASSWORD=kali
 # QA_ENABLED=1
 # RANGE_MODE=blackbox
 # RANGE_NETWORKS=192.168.56.0/24
+# RANGE_EXCLUDED_NETWORKS=192.168.100.0/24,172.16.0.0/24
 ```
 
 ### LLM provider examples
@@ -321,7 +325,8 @@ backend uses `local` as its default LiteLLM key when none is supplied.
 | `HUMAN_INTERACTION` | `0` | `1` enables `ask_human` in QA mode; QA defaults to `1`. |
 | `RANGE_MODE` | unset | Read only when QA is enabled; must be `blackbox` or `whitebox`. |
 | `RANGE_SPEC_PATH` | unset | White-box spec path; required when `RANGE_MODE=whitebox`. |
-| `RANGE_NETWORKS` | unset | Attacker-side probe CIDRs, separated by commas or semicolons. |
+| `RANGE_NETWORKS` | unset | Attacker-side discovery/probe CIDRs, separated by commas or semicolons; not an allowlist for arbitrary attack commands. |
+| `RANGE_EXCLUDED_NETWORKS` | unset | Hard-deny CIDRs, separated by commas or semicolons. Literal IP/CIDR targets in attacker SSH or routed victim-shell commands that overlap these networks are silently skipped before transport; no policy-specific result is emitted. |
 | `RANGE_CONTROL_PLANE_MODULE` | unset | Management/control-plane adapter in `module:factory` form. |
 | `RANGE_VICTIM_MODULE` | unset | Victim command/session adapter in `module:factory` form. |
 | `QA_REPORT_PATH` | `logs/qa-report.md` | Continuously updated Markdown QA report. |
@@ -332,7 +337,8 @@ QA variables are ignored by the default run unless `QA_ENABLED=1`, `--qa`, or
 values loaded from `.env`.
 
 > **中文摘要：** 預設不啟用 QA；使用 `QA_ENABLED=1` 或 `--qa` 才會載入
-> preflight、report、adapter 與 host assessment。shell 設定優先於 `.env`。
+> preflight、report、adapter 與背景 host assessment。`RANGE_EXCLUDED_NETWORKS`
+> 是程式強制排除清單；命中時不送出命令，也不額外回傳 blocked/126；shell 設定優先於 `.env`。
 
 ## Command-line usage
 
@@ -490,10 +496,27 @@ Without a white-box spec, the global adapter runs these commands from Kali:
 - `cat /etc/resolv.conf`
 - `nmap -sn -n -T3 <network>` for every configured `RANGE_NETWORKS` CIDR
 
+`RANGE_NETWORKS` controls these initial attacker-side probes only. It is not a
+runtime allowlist for arbitrary shell commands because the original Cochise
+executor accepts natural-language-selected shell text. Use
+`RANGE_EXCLUDED_NETWORKS` for the program-enforced deny list:
+
+```dotenv
+RANGE_EXCLUDED_NETWORKS=192.168.100.0/24,172.16.0.0/24
+```
+
+Before an attacker SSH command or routed victim-shell command is sent, literal
+IPv4/IPv6 addresses and CIDR targets in the command are checked for overlap.
+Matching commands are silently skipped and never sent to the transport; no
+policy-specific marker or synthetic exit status is returned. Hostnames or
+scripts that construct destinations dynamically cannot be resolved by this
+shell-text guard and still require an appropriate range adapter or network
+control plane.
+
 For a structured host with an IP, host collection uses
 `nmap -Pn -n -sT --top-ports 100 <address>`. Without host metadata, host QA
 starts only after the attack workflow confirms access through
-`register_host_access`.
+`register_host_access`; it then runs in the background.
 
 ### White-box mode
 
@@ -505,8 +528,9 @@ discovery; unobservable properties remain `unknown`.
 
 ### Host QA coverage
 
-Each host worker first performs a common observable baseline. The LLM then
-selects applicable platform checks from evidence:
+Each background host worker first performs a common observable baseline. The LLM
+then selects applicable platform checks from evidence while the main Planner can
+continue attack or validation work:
 
 - **Windows endpoint:** workstation/server, domain membership, build, users and
   groups, services, firewall, Defender/EDR, SMB/WinRM/RDP, PowerShell, UAC,
@@ -657,8 +681,9 @@ provenance; it does not execute spec text directly.
 - Each Executor task has at most 25 command-selection rounds, plus five human
   recovery rounds in interactive mode. Three consecutive no-progress rounds
   stop the task.
-- Each host assessment has at most 12 LLM rounds. Three consecutive rounds with
-  no executable progress stop that host worker.
+- Each background host assessment has at most 12 LLM rounds. Three consecutive
+  rounds with no executable progress stop that host worker without stopping the
+  attack planner.
 - Multiple tool calls in one Executor response run concurrently with asyncio.
 - The SSH command timeout is 600 seconds. `LLM_TIMEOUT_SECONDS` applies only to
   LiteLLM requests.
@@ -677,13 +702,13 @@ With `HUMAN_INTERACTION=1`, Planner, Executor, and enabled Host QA may call
 `ask_human` when:
 
 - an expected file or artifact is missing;
-- a blocking global or host assessment needs correction or an explicit stop;
+- a QA worker needs missing information or an explicit stop;
 - the Executor reaches its normal 25-round limit without a result.
 
 With `HUMAN_INTERACTION=0`, Cochise does not read stdin and removes `ask_human`
-from autonomous LLM tool surfaces. Blocking assessment findings are recorded
-and automatically overridden so the run can continue; this does not make the
-finding pass or repair the environment. Workers still stop after repeated
+from autonomous LLM tool surfaces. Assessment findings are recorded as
+unknown/blocked evidence and the attack planner continues; this does not make
+the finding pass or repair the environment. Workers still stop after repeated
 rounds without executable progress.
 
 ## Testing and development validation
@@ -715,14 +740,14 @@ authorized scope.
 |---|---|
 | `src/cochise/cli/cochise.py` | Main entry point, `.env`, LLM/SSH/QA wiring. |
 | `src/cochise/common.py` | LiteLLM wrapper, provider mapping, tool schemas, retry/timeout. |
-| `src/cochise/planner.py` | Persistent Planner, plan compaction, host QA gates. |
+| `src/cochise/planner.py` | Persistent Planner, plan compaction, live QA context, and background QA scheduling. |
 | `src/cochise/executor.py` | Ephemeral Executor, parallel tools, human recovery. |
 | `src/cochise/assessment.py` | Range specs, black-box/control-plane/victim adapters, global/host QA. |
 | `src/cochise/qa_guidance.py` | Raw human QA guidance, provenance, hash, bounded semantic context. |
 | `src/cochise/qa_report.py` | Live Markdown report, redaction, coverage/conformance. |
 | `src/cochise/artifacts.py` | JSONL artifact manifest and content-hash deduplication. |
 | `src/cochise/knowledge.py` | Accounts, entities, hosts, findings, expectations, privileges, shells. |
-| `src/cochise/ssh_connection.py` | AsyncSSH attacker/Kali transport. |
+| `src/cochise/ssh_connection.py` | AsyncSSH attacker/Kali transport and hard excluded-network command guard. |
 | `src/cochise/logger.py` | Rich console and `logs/run-*.json` structured trajectory. |
 | `src/cochise/templates/scenario.md` | Current objective, rules, and tool guidance system context. |
 | `src/cochise/templates/assessment_prompt.md.jinja2` | Host QA semantic assessment and evidence contract. |

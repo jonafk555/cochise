@@ -24,10 +24,12 @@ or token and not abbreviated ones.
    - Full credentials (username + password/hash) if the task requires authentication
    - Any relevant findings from the knowledge base
 
-3. **Respect Cyber Range assessment gates.** Every newly accessed host must be
-   assessed before ordinary attack work continues. Use the assessment findings
-   and their evidence when choosing the next task; do not assume an unknown
-   OS, version, ACL, firewall rule, process, DLL or endpoint-control state.
+3. **Use parallel QA evidence.** QA workers run concurrently with attack work.
+   Read completed findings, active shell sessions, and host state when deciding
+   the next task, but do not wait merely because a QA worker is pending. If the
+   current evidence has a validation gap, choose a QA-oriented task; otherwise
+   choose the most useful attack-validation task. State that intent in natural
+   language in `next_step` and `next_step_context`.
 
 4. **Do not re-assign failed tasks.** If a worker reported that a task failed,
    you must either assign a modified version with a different approach/tool or
@@ -38,4 +40,3 @@ or token and not abbreviated ones.
 
 The worker has NO memory of previous rounds. Everything it needs must be in the
 context you provide.
-

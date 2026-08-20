@@ -1,9 +1,93 @@
+from __future__ import annotations
+
+import ipaddress
+import os
+import re
+
 import asyncssh
 
 from asyncssh import SSHClientConnection
 from dataclasses import dataclass
+from typing import Iterable
 
 from cochise.common import get_or_fail
+
+
+_IP_LITERAL_RE = re.compile(
+    r"(?<![0-9A-Za-z_.])"
+    r"(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?"
+    r"(?![0-9A-Za-z_.])"
+    r"|"
+    r"(?<![0-9A-Fa-f:])"
+    r"(?:[0-9A-Fa-f]{1,4}:){2,}[0-9A-Fa-f:.]+(?:/\d{1,3})?"
+    r"(?![0-9A-Fa-f:])"
+)
+
+
+def parse_network_list(value: str | Iterable[str] | None) -> tuple[ipaddress._BaseNetwork, ...]:
+    """Parse comma/semicolon-separated CIDRs for the hard exclusion policy."""
+
+    if value is None:
+        return ()
+    values = value.replace(";", ",").split(",") if isinstance(value, str) else value
+    networks: list[ipaddress._BaseNetwork] = []
+    for raw_value in values:
+        raw = str(raw_value).strip()
+        if not raw:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(raw, strict=False))
+        except ValueError as exc:
+            raise ValueError(
+                f"RANGE_EXCLUDED_NETWORKS contains an invalid network: {raw}"
+            ) from exc
+    # Stable de-duplication keeps logs and rejection messages deterministic.
+    return tuple(dict.fromkeys(networks))
+
+
+def find_excluded_targets(
+    command: str,
+    excluded_networks: Iterable[ipaddress._BaseNetwork],
+) -> list[str]:
+    """Return IP/CIDR literals in ``command`` that overlap an excluded network.
+
+    The command interface accepts arbitrary shell text, so a runtime guard can
+    reliably reject literal IP/CIDR targets but cannot infer the destination of
+    an opaque hostname or a script that constructs its target dynamically.
+    """
+
+    excluded = tuple(excluded_networks)
+    if not excluded:
+        return []
+
+    blocked: list[str] = []
+    for match in _IP_LITERAL_RE.finditer(str(command)):
+        literal = match.group(0).strip("[]")
+        try:
+            candidate: ipaddress._BaseNetwork | ipaddress._BaseAddress
+            if "/" in literal:
+                candidate = ipaddress.ip_network(literal, strict=False)
+            else:
+                candidate = ipaddress.ip_address(literal)
+        except ValueError:
+            continue
+
+        overlaps = False
+        for network in excluded:
+            try:
+                overlaps = (
+                    candidate.overlaps(network)
+                    if isinstance(candidate, ipaddress._BaseNetwork)
+                    else candidate in network
+                )
+            except TypeError:
+                # IPv4 and IPv6 ranges cannot overlap.
+                overlaps = False
+            if overlaps:
+                break
+        if overlaps and literal not in blocked:
+            blocked.append(literal)
+    return blocked
 
 @dataclass
 class SSHConnection:
@@ -12,6 +96,7 @@ class SSHConnection:
     password: str = 'changeme'
     port: int = 22
     timeout: int = 600
+    excluded_networks: tuple[ipaddress._BaseNetwork, ...] = ()
 
     _conn: SSHClientConnection|None = None
 
@@ -32,7 +117,12 @@ class SSHConnection:
             'exit_status': result.returncode
         }
     
-    async def execute_command(self, command: str, mitre_attack_technique: str, mitre_attack_procedure: str) -> str:
+    async def execute_command(
+        self,
+        command: str,
+        mitre_attack_technique: str,
+        mitre_attack_procedure: str,
+    ) -> str:
         """Execute a command over SSH and return the output.
 
         Parameters
@@ -51,6 +141,13 @@ class SSHConnection:
         str
             The output of the executed command.
         """
+        excluded_targets = find_excluded_targets(command, self.excluded_networks)
+        if excluded_targets:
+            # Keep the scope boundary inside Python, but do not expose a
+            # policy-specific tool result to the LLM.  The excluded command is
+            # simply not sent to the SSH transport.
+            return ""
+
         try:
             return str((await self.run(command))['stdout'])
         except asyncssh.misc.ChannelOpenError:
@@ -72,4 +169,10 @@ def get_ssh_connection_from_env() -> SSHConnection:
     username = get_or_fail("TARGET_USERNAME")
     password = get_or_fail("TARGET_PASSWORD")
 
-    return SSHConnection(host=host, username=username, password=password)
+    excluded_networks = parse_network_list(os.getenv("RANGE_EXCLUDED_NETWORKS", ""))
+    return SSHConnection(
+        host=host,
+        username=username,
+        password=password,
+        excluded_networks=excluded_networks,
+    )

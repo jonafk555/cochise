@@ -34,8 +34,9 @@ The `async_main()` function is the single entry point. It performs setup in a st
    `QA_ENABLED=1` or `--qa` is selected.
 6. **Start the run** by calling `planner.engage()`. The default Planner follows
    the original Cochise flow. When `QA_ENABLED=1` (or `--qa`) is selected, the
-   optional global Cyber Range preflight runs before the initial attack plan and
-   `QA_REPORT_PATH` points to the continuously updated Markdown report.
+   optional global Cyber Range preflight starts in the background alongside the
+   attack plan and `QA_REPORT_PATH` points to the continuously updated Markdown
+   report.
 
 The scenario text is loaded at import time from `templates/scenario.md` and
 describes the configured penetration-test objective.
@@ -66,9 +67,9 @@ Then enters the main loop (bounded by `max_runtime`):
 
 **Each round:**
 
-1. **When QA is enabled, run pending host assessments:** Any newly registered
-   host is assessed before ordinary attack work continues. Blocking results
-   pause for human guidance.
+1. **When QA is enabled, schedule pending host assessments:** Any newly
+   registered host starts a background QA worker. Attack work continues while
+   the worker collects evidence and updates shared knowledge.
 2. **Check compaction triggers:** If `max_interactions` exceeded or `last_input_tokens >= max_context_size`, call `compact_history()` to summarize and reset the conversation.
 3. **Build a fresh Executor** via `executor_factory.build(self.knowledge)`. Each executor starts with no memory of previous rounds but receives the current knowledge base.
 4. **Register tools** as an `LLMFunctionMapping`:
@@ -77,8 +78,8 @@ Then enters the main loop (bounded by `max_runtime`):
    - `knowledge.update_compromised_account` -- update an existing credential
    - `knowledge.add_entity_information` -- store recon findings
    - `knowledge.update_entity_information` -- update recon findings
-   - `knowledge.register_host_access` -- mark a newly accessed host for QA
-     assessment (QA mode only)
+   - `knowledge.register_host_access` -- mark a newly accessed host for
+     background QA assessment (QA mode only)
 5. **Call LLM** with `llm_tool_call()`, passing the history and tool definitions. The LLM selects a task and calls the appropriate tool.
 6. **Process tool calls:** For each tool call in the response:
    - Execute the function (e.g., `executor.perform_task(...)` which runs the full executor loop).
@@ -102,9 +103,9 @@ This keeps the context window bounded while preserving strategic state.
 
 **File:** `src/cochise/assessment.py`
 
-When enabled, the assessment coordinator provides two QA gates:
+When enabled, the assessment coordinator provides two parallel QA workers:
 
-1. A global black-box preflight runs from the attacker VM before the initial
+1. A global black-box preflight runs from the attacker VM alongside the initial
    Planner plan. It records interface, route, DNS, and configured network
    reachability evidence. A white-box YAML, JSON, Markdown, or natural-language
    spec can add expected topology and host facts; the LLM interprets the raw
@@ -114,19 +115,20 @@ When enabled, the assessment coordinator provides two QA gates:
    startup with `--qa-instructions path/to/human-qa.md`; this is semantic QA
    intent and is never executed as a script.
 2. The Executor calls `register_host_access` after confirming a newly accessed
-   host. Before the Planner selects another ordinary task, a short-lived LLM
-   QA supervisor/host worker performs read-only inventory and then
+   host. A short-lived background LLM QA supervisor/host worker performs
+   read-only inventory and then
    attack-feasibility validation for that host. It runs the common baseline and
    only the applicable Windows endpoint (workstation/server, joined or
    standalone), Windows AD, and Linux (AD-integrated or standalone) checks.
    Optional victim-side commands are correlated with attacker-side evidence.
 
-With human interaction enabled, blocking findings pause for human guidance. With
-`HUMAN_INTERACTION=0`, the coordinator records the finding and the Planner
-automatically overrides the gate so autonomous execution can continue. The
-autonomous LLM workers do not receive `ask_human`, and bounded no-progress
-guards stop a worker that cannot produce executable work. Cochise never
-performs automatic range remediation.
+The Planner receives the current QA findings, host state, and worker status as
+natural-language context and decides whether its next delegated task should be
+attack validation or QA validation. Python does not choose that branch. With
+`HUMAN_INTERACTION=0`, findings remain recorded as unknown/blocked evidence and
+the attack planner continues. Bounded no-progress guards stop a worker that
+cannot produce executable work. Cochise never performs automatic range
+remediation.
 
 ---
 
@@ -173,7 +175,7 @@ A simple in-memory store with two dictionaries and an auto-incrementing counter:
 
 - **`compromised_accounts`**: keyed by ID, stores `{username, password, context, dirty}`.
 - **`entity_information`**: keyed by ID, stores `{entity, information, dirty}`.
-- **`hosts`**: keyed by host ID, tracks confirmed access and assessment-gate state.
+- **`hosts`**: keyed by host ID, tracks confirmed access and background QA state.
 - **`assessment_findings`**: structured black-box/white-box evidence and severity.
 
 ### Key Operations
@@ -186,8 +188,8 @@ A simple in-memory store with two dictionaries and an auto-incrementing counter:
 | `update_entity_information` | LLM via tool call | Update existing recon info |
 | `merge(other)` | Planner, after executor returns | Copy dirty entries from executor's local knowledge into the planner's global knowledge |
 | `get_knowledge()` | Planner/Executor prompts | Render all knowledge as markdown tables for LLM context |
-| `register_host_access` | Executor via tool call | Mark a newly accessed host as pending assessment |
-| `record_assessment_result` | Assessment coordinator | Persist findings and complete a host gate |
+| `register_host_access` | Executor via tool call | Mark a newly accessed host for background assessment |
+| `record_assessment_result` | Assessment coordinator | Persist findings and update host QA state |
 
 ### Dirty Flag Mechanism
 
@@ -221,10 +223,9 @@ before Cyber Range assessment begins.
 The `ask_human` tool is registered for the Planner and Executor when human
 interaction is enabled. It pauses the terminal without blocking the event
 loop, appends the response to the current conversation, and lets the model
-continue. In autonomous mode it is removed from the LLM tool surface;
-programmatic assessment gates record an automatic override instead. The
-interactive Executor also asks automatically after exhausting its normal
-command-selection rounds.
+continue. In autonomous mode it is removed from the LLM tool surface; QA
+findings remain recorded while attack work continues. The interactive Executor
+also asks automatically after exhausting its normal command-selection rounds.
 
 ### `llm_call(model, api_key, messages)`
 
@@ -246,7 +247,7 @@ Used for simple completions without tools (initial plan creation, history compac
 A dataclass wrapping `asyncssh` for command execution on the target:
 
 - `connect()` -- establishes the SSH connection.
-- `execute_command(command, mitre_attack_technique, mitre_attack_procedure)` -- the LLM-callable tool. Runs a command via SSH, handles timeouts (600s default) and channel errors with automatic reconnection. Returns stdout as a string.
+- `execute_command(command, mitre_attack_technique, mitre_attack_procedure)` -- the LLM-callable tool. It silently skips literal IP/CIDR targets overlapping `RANGE_EXCLUDED_NETWORKS` without sending them to SSH, then runs allowed commands, handles timeouts (600s default), and reconnects after channel errors.
 - `get_ssh_connection_from_env()` -- factory reading `TARGET_HOST`, `TARGET_USERNAME`, `TARGET_PASSWORD` from environment.
 
 ---

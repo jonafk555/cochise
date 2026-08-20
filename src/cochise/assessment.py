@@ -37,6 +37,7 @@ from cochise.human_interaction import HumanInteraction, is_stop_response
 from cochise.knowledge import Knowledge
 from cochise.qa_report import QAReportWriter
 from cochise.qa_guidance import QAGuidance
+from cochise.ssh_connection import find_excluded_targets
 
 
 TEMPLATE_DIR = pathlib.Path(__file__).parent / "templates"
@@ -465,8 +466,20 @@ class VictimCommandRouter:
     output/exit_status and optional shell metadata.
     """
 
-    def __init__(self, adapter: VictimAdapter):
+    def __init__(
+        self,
+        adapter: VictimAdapter,
+        excluded_networks: tuple[Any, ...] = (),
+    ):
         self.adapter = adapter
+        self.excluded_networks = tuple(excluded_networks)
+
+    def _has_excluded_target(self, target: str, command: str) -> bool:
+        excluded_targets = find_excluded_targets(
+            f"{target} {command}",
+            self.excluded_networks,
+        )
+        return bool(excluded_targets)
 
     async def execute_victim_command(
         self,
@@ -475,6 +488,8 @@ class VictimCommandRouter:
         purpose: str = "",
         shell_id: str = "",
     ) -> Any:
+        if self._has_excluded_target(host_id, command):
+            return ""
         result = await self.adapter.execute_victim_command(
             host_id,
             command,
@@ -502,6 +517,8 @@ class VictimCommandRouter:
         command: str,
         purpose: str = "",
     ) -> Any:
+        if self._has_excluded_target(shell_id, command):
+            return ""
         method = getattr(self.adapter, "execute_shell_command", None)
         if method is None:
             return {
@@ -528,7 +545,10 @@ class VictimCommandRouter:
         }
 
 
-def load_victim_adapter(reference: str | None) -> VictimCommandRouter | None:
+def load_victim_adapter(
+    reference: str | None,
+    excluded_networks: tuple[Any, ...] = (),
+) -> VictimCommandRouter | None:
     """Load an optional victim adapter using the existing ``module:factory`` hook."""
 
     if not reference:
@@ -540,7 +560,7 @@ def load_victim_adapter(reference: str | None) -> VictimCommandRouter | None:
     adapter = factory()
     if not hasattr(adapter, "execute_victim_command"):
         raise TypeError("Victim adapter must implement execute_victim_command")
-    return VictimCommandRouter(adapter)
+    return VictimCommandRouter(adapter, excluded_networks)
 
 
 class CompositeRangeAdapter:
