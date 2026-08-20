@@ -71,8 +71,9 @@ def _qa_enabled(args: argparse.Namespace) -> bool:
 async def async_main(argv: list[str] | None = None) -> None:
 
     # setup configuration from environment variables
-    # Match the original Cochise behavior: explicit shell values win over .env.
-    load_dotenv()
+    # Project configuration must be reproducible: values in .env override
+    # inherited shell variables, while explicit CLI arguments still win below.
+    load_dotenv(override=True)
     args = _parse_arguments(argv)
     qa_enabled = _qa_enabled(args)
     qa_guidance = None

@@ -100,12 +100,12 @@ def _model_name(model: str | LLMConfig) -> str:
 
 
 def _is_openai_tool_reasoning_model(model: str | LLMConfig) -> bool:
-    """Return whether Chat Completions needs an explicit no-reasoning setting.
+    """Return whether LiteLLM applies GPT-5.4+ tool-call compatibility logic.
 
-    OpenAI GPT-5.4+ deployments reject function tools together with a non-none
-    ``reasoning_effort`` on ``/v1/chat/completions``.  The version suffix is
-    intentionally parsed instead of matching one model alias so compatible
-    deployments such as ``gpt-5.6-luna`` receive the same treatment.
+    LiteLLM may bridge GPT-5.4+ calls with tools and ``reasoning_effort`` to the
+    Responses API.  The version suffix is intentionally parsed instead of
+    matching one model alias so compatible deployments such as
+    ``gpt-5.6-luna`` receive the same treatment.
     """
 
     provider = _model_provider(model)
@@ -148,6 +148,38 @@ def _tool_call_compatibility_kwargs(model: str | LLMConfig) -> dict[str, str]:
         return {"reasoning_effort": configured}
 
     return {"reasoning_effort": "none"}
+
+
+def _tool_choice_for_litellm_bridge(
+    model: str | LLMConfig,
+    tool_choice: dict[str, Any] | str,
+    *,
+    has_tools: bool,
+    compatibility_kwargs: dict[str, str],
+) -> dict[str, Any] | str:
+    """Use the tool-choice shape expected by LiteLLM's Responses bridge.
+
+    Cochise's internal tool protocol follows Chat Completions.  LiteLLM
+    1.83.0 converts GPT-5.4+ tool requests to Responses when
+    ``reasoning_effort`` is present, but it does not convert a named
+    ``tool_choice``.  Convert only in that bridge case; ordinary Chat
+    Completions providers must retain the nested function shape.
+    """
+
+    if (
+        not has_tools
+        or not compatibility_kwargs
+        or not _is_openai_tool_reasoning_model(model)
+        or not isinstance(tool_choice, dict)
+        or tool_choice.get("type") != "function"
+    ):
+        return tool_choice
+
+    function = tool_choice.get("function")
+    if not isinstance(function, dict) or not function.get("name"):
+        return tool_choice
+
+    return {"type": "function", "name": function["name"]}
 
 
 def _env_first(*names: str) -> str | None:
@@ -578,14 +610,21 @@ def llm_tool_call(
 ):
 
     tik = datetime.datetime.now()
+    tool_definitions = tools.get_tool_definitions()
+    compatibility_kwargs = _tool_call_compatibility_kwargs(model)
     completion_kwargs = {
         "messages": messages,
-        "tools": tools.get_tool_definitions(),
+        "tools": tool_definitions,
         **_completion_kwargs(model, api_key),
-        **_tool_call_compatibility_kwargs(model),
+        **compatibility_kwargs,
     }
     if tool_choice is not None:
-        completion_kwargs["tool_choice"] = tool_choice
+        completion_kwargs["tool_choice"] = _tool_choice_for_litellm_bridge(
+            model,
+            tool_choice,
+            has_tools=bool(tool_definitions),
+            compatibility_kwargs=compatibility_kwargs,
+        )
     response = _completion_with_retry(completion_kwargs, operation=operation)
     tok = datetime.datetime.now()
 

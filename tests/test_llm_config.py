@@ -237,6 +237,77 @@ class LLMConfigTests(unittest.TestCase):
         self.assertEqual(captured["tool_choice"]["type"], "function")
         self.assertEqual(costs["total_tokens"], 2)
 
+    def test_gpt_5_4_plus_named_tool_choice_uses_responses_bridge_shape(self):
+        captured = {}
+
+        def fake_completion(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="ok", tool_calls=[])
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+                _hidden_params={},
+            )
+
+        config = common.LLMConfig(
+            provider="openai",
+            model="openai/gpt-5.6-luna",
+        )
+        tools = common.LLMFunctionMapping([common._llm_healthcheck_tool])
+        with patch.dict(os.environ, {"LLM_REASONING_EFFORT": "low"}), patch.object(
+            common.litellm, "completion", fake_completion
+        ):
+            common.llm_tool_call(
+                config,
+                None,
+                tools,
+                [{"role": "user", "content": "ping"}],
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "_llm_healthcheck_tool"},
+                },
+            )
+
+        self.assertEqual(
+            captured["tool_choice"],
+            {"type": "function", "name": "_llm_healthcheck_tool"},
+        )
+
+    def test_regular_chat_completions_keep_nested_named_tool_choice(self):
+        captured = {}
+
+        def fake_completion(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="ok", tool_calls=[])
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+                _hidden_params={},
+            )
+
+        config = common.LLMConfig(provider="openai", model="openai/gpt-4o")
+        tools = common.LLMFunctionMapping([common._llm_healthcheck_tool])
+        expected = {
+            "type": "function",
+            "function": {"name": "_llm_healthcheck_tool"},
+        }
+        with patch.object(common.litellm, "completion", fake_completion):
+            common.llm_tool_call(
+                config,
+                None,
+                tools,
+                [{"role": "user", "content": "ping"}],
+                tool_choice=expected,
+            )
+
+        self.assertEqual(captured["tool_choice"], expected)
+
     def test_network_failure_is_wrapped_and_retried_once(self):
         config = common.LLMConfig(provider="anthropic", model="anthropic/test")
         failure = RuntimeError("[Errno 101] Network is unreachable")

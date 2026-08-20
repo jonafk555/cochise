@@ -286,6 +286,10 @@ provider-specific variables, and then the legacy LiteLLM variable. Cloud
 providers require an API key. Local Ollama does not. A local OpenAI-compatible
 backend uses `local` as its default LiteLLM key when none is supplied.
 
+The repository `.env` is loaded with `override=True`, so values in `.env` take
+precedence over inherited shell variables. This keeps the selected provider,
+model, API key, and endpoint consistent across interactive shells and `uv run`.
+
 ### Complete `.env` reference
 
 #### Required connection variables
